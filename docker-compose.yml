@@ -12,6 +12,7 @@ name: ai-factory
 x-plane: &plane
   build: { context: ., dockerfile: docker/Dockerfile.plane }
   image: ai-factory/plane:latest
+  user: root # Docker socket access for the Docker launcher (development only)
   depends_on: { postgres: { condition: service_healthy } }
   environment: &plane-env
     DATABASE_URL: postgres://factory:factory@postgres:5432/factory

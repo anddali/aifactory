@@ -63,7 +63,8 @@ pub fn router(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(portal::routes())
         .merge(webhooks::routes())
-        .merge(crate::model_endpoint::routes());
+        .merge(crate::model_endpoint::routes())
+        .merge(crate::fake_litellm::routes());
     if state.cfg.dev_login {
         r = r.merge(fake::routes());
     }

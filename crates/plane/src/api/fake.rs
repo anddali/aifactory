@@ -28,6 +28,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/fake/{cid}/chat/messages", get(chat_messages))
         .route("/api/fake/{cid}/chat/reply", post(chat_reply))
         .route("/api/fake/{cid}/chat/redeliver", post(chat_redeliver))
+        .route("/api/fake/entra/user", post(crate::entra::fake::set_user))
+        .route("/fake-entra/{tenant}/oauth2/v2.0/authorize", get(crate::entra::fake::authorize))
+        .route("/fake-entra/{tenant}/oauth2/v2.0/token", post(crate::entra::fake::token))
 }
 
 async fn fake_repo(state: &AppState, cid: Uuid) -> ApiResult<FakeRepo> {
@@ -149,6 +152,24 @@ async fn pr_action(State(state): State<AppState>, _u: User, Path(cid): Path<Uuid
         "reply" => Some(f.human_reply(&a.repo, n, &author, a.thread_id.as_deref().unwrap_or(""), a.body.as_deref().unwrap_or("")).await?),
         "state" => Some(f.set_state(&a.repo, n, a.state.as_deref().unwrap_or("closed")).await?),
         "open" => {
+            // Optionally create the head branch from the base with some files first.
+            if let (Some(files), Some(head)) = (a.files.clone(), a.head.clone()) {
+                let bare = f.repo_path(&a.repo)?;
+                let tmp = tempfile::tempdir().map_err(anyhow::Error::from)?;
+                let w = tmp.path().join("w");
+                git(None, &["clone", "-q", "-b", a.base.as_deref().unwrap_or("main"), &bare.to_string_lossy(), &w.to_string_lossy()]).await?;
+                git(Some(&w), &["checkout", "-q", "-b", &head]).await?;
+                for (p, c) in files {
+                    let fp = w.join(&p);
+                    if let Some(d) = fp.parent() {
+                        std::fs::create_dir_all(d).map_err(anyhow::Error::from)?;
+                    }
+                    std::fs::write(fp, c).map_err(anyhow::Error::from)?;
+                }
+                git(Some(&w), &["add", "-A"]).await?;
+                git(Some(&w), &["-c", &format!("user.name={author}"), "-c", "user.email=human@example.test", "commit", "-q", "-m", a.title.as_deref().unwrap_or("change")]).await?;
+                git(Some(&w), &["push", "-q", "origin", &head]).await?;
+            }
             let pr = f
                 .human_open_pr(&a.repo, a.head.as_deref().unwrap_or(""), a.base.as_deref().unwrap_or("main"), a.title.as_deref().unwrap_or("Change"), a.body.as_deref().unwrap_or(""), &author)
                 .await?;

@@ -45,5 +45,7 @@ prometheus = "0.14"
 serde_norway = "0.9"
 url = "2"
 async-stream = "0.3"
+aws-config = { version = "1.13", features = ["behavior-version-latest"] }
+aws-sdk-ecs = "1.159"
 
 [dev-dependencies]

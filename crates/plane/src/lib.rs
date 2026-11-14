@@ -12,6 +12,7 @@ pub mod engine;
 pub mod entra;
 pub mod humans;
 pub mod events;
+pub mod fake_litellm;
 pub mod git;
 pub mod gitutil;
 pub mod jobs;

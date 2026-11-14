@@ -223,7 +223,7 @@ pub async fn detect_after_turn(state: &AppState, run: &Run, tc: &proto::TurnComp
             .await?;
         if let Some(from) = turn_starts.last() {
             let progress: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM events WHERE run_id=$1 AND seq >= $2 AND kind IN ('primitive_call','git_push') AND (payload->>'side_effect')::bool IS TRUE AND (payload->>'ok')::bool IS TRUE",
+                "SELECT count(*) FROM events WHERE run_id=$1 AND seq >= $2 AND kind IN ('primitive_call','git_push') AND (payload->>'side_effect')::bool IS TRUE AND (payload->>'ok')::bool IS TRUE AND COALESCE(payload->>'name','') NOT IN ('status.report','human.message','human.ask','status.blocked')",
             )
             .bind(run.id)
             .bind(from)

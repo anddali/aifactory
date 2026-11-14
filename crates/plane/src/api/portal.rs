@@ -51,6 +51,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/metrics/outcomes", get(outcomes))
         .route("/api/_tick", post(force_tick))
         .route("/api/_purge", post(force_purge))
+        .route("/api/_housekeeping", post(force_housekeeping))
         .route("/api/_unused", delete(|| async { "" }))
 }
 
@@ -804,4 +805,13 @@ async fn force_purge(State(state): State<AppState>, user: User) -> ApiResult<Jso
     user.require_admin(&state).await?;
     let n = crate::singleton::purge_checkpoints(&state).await?;
     Ok(Json(json!({"purged": n})))
+}
+
+/// Run partition maintenance, retention and checkpoint purge now.
+async fn force_housekeeping(State(state): State<AppState>, user: User) -> ApiResult<Json<Value>> {
+    user.require_admin(&state).await?;
+    let s = crate::settings::get(&state.pool).await?;
+    crate::events::maintain_partitions(&state.pool, s.event_retention_days).await?;
+    let n = crate::singleton::purge_checkpoints(&state).await?;
+    Ok(Json(json!({"purged_checkpoints": n})))
 }

@@ -96,6 +96,8 @@ pub struct Env {
 }
 
 pub struct Opts {
+    /// Launch runners as Docker containers instead of local processes.
+    pub docker: bool,
     pub replicas: usize,
     pub fault: Option<&'static str>,
     pub project_config: Value,
@@ -103,7 +105,7 @@ pub struct Opts {
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { replicas: 1, fault: None, project_config: json!({}) }
+        Opts { docker: false, replicas: 1, fault: None, project_config: json!({}) }
     }
 }
 
@@ -120,7 +122,9 @@ impl Env {
         let repo_root = root.path().join("fake-repos");
         std::fs::create_dir_all(&repo_root).unwrap();
         let ports: Vec<u16> = (0..opts.replicas).map(|_| free_port()).collect();
-        let public = ports.iter().map(|p| format!("http://127.0.0.1:{p}")).collect::<Vec<_>>().join(",");
+        let host = if opts.docker { "host.docker.internal" } else { "127.0.0.1" };
+        let public = ports.iter().map(|p| format!("http://{host}:{p}")).collect::<Vec<_>>().join(",");
+        let listen_host = if opts.docker { "0.0.0.0" } else { "127.0.0.1" };
         let mut replicas = vec![];
         for (i, port) in ports.iter().enumerate() {
             let data_dir = root.path().join(format!("plane{i}"));
@@ -128,7 +132,7 @@ impl Env {
             let mut env = vec![
                 ("DATABASE_URL".into(), db_url.clone()),
                 ("FACTORY_ENCRYPTION_KEYS".into(), format!("k1:{KEY_B64}")),
-                ("FACTORY_LISTEN_ADDR".into(), format!("127.0.0.1:{port}")),
+                ("FACTORY_LISTEN_ADDR".into(), format!("{listen_host}:{port}")),
                 ("FACTORY_PUBLIC_URLS".into(), public.clone()),
                 ("FACTORY_DATA_DIR".into(), data_dir.to_string_lossy().to_string()),
                 ("FACTORY_DEV_LOGIN".into(), "1".into()),
@@ -137,6 +141,19 @@ impl Env {
                 ("FACTORY_SUPERVISOR_BIN".into(), bin("supervisor").to_string_lossy().to_string()),
                 ("RUST_LOG".into(), "info,sqlx=warn".into()),
             ];
+            // Entra sign-in against the plane's own fake Entra.
+            for (k, v) in [
+                ("FACTORY_ENTRA_TENANT_ID", "t1".to_string()),
+                ("FACTORY_ENTRA_CLIENT_ID", "factory-client".to_string()),
+                ("FACTORY_ENTRA_CLIENT_SECRET", "fake-entra-secret".to_string()),
+                ("FACTORY_ENTRA_AUTHORITY", format!("http://127.0.0.1:{port}/fake-entra/t1")),
+                ("FACTORY_ENTRA_REDIRECT_URL", format!("http://127.0.0.1:{port}/auth/entra/callback")),
+            ] {
+                env.push((k.into(), v));
+            }
+            if let Some(c) = local_copilot() {
+                env.push(("FACTORY_COPILOT_BIN".into(), c));
+            }
             if let Some(f) = opts.fault {
                 env.push(("FACTORY_TEST_RUNNER_FAULT".into(), f.into()));
             }
@@ -166,6 +183,9 @@ impl Env {
         };
         env.session = env.login(ADMIN).await;
         env.setup(opts.project_config).await;
+        if opts.docker {
+            env.put("/api/settings", json!({"launcher": "docker", "heartbeat_secs": 2})).await;
+        }
         env
     }
 
@@ -409,4 +429,17 @@ pub async fn wait_http(http: &reqwest::Client, url: &str) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     panic!("{url} never became ready");
+}
+
+/// The Copilot CLI to use in tests: FACTORY_COPILOT_BIN, else the newest
+/// locally auto-updated package under ~/.copilot/pkg, else None (PATH).
+pub fn local_copilot() -> Option<String> {
+    if let Ok(b) = std::env::var("FACTORY_COPILOT_BIN") {
+        return Some(b);
+    }
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    let dir = std::path::Path::new(&home).join(".copilot").join("pkg").join("universal");
+    let mut versions: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.join("index.js").exists()).collect();
+    versions.sort_by_key(|p| p.file_name().map(|n| n.to_string_lossy().split('.').map(|x| x.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>()).unwrap_or_default());
+    versions.last().map(|p| p.join("index.js").to_string_lossy().into_owned())
 }

@@ -46,6 +46,8 @@ pub struct Run {
     pub turn_started_at: Option<DateTime<Utc>>,
     pub current_instruction: Option<i64>,
     pub token_salt: String,
+    #[serde(skip)]
+    pub model_key_ref: Option<String>,
     pub last_activity_at: DateTime<Utc>,
     pub reminder_sent_at: Option<DateTime<Utc>>,
     pub warning_sent_at: Option<DateTime<Utc>>,

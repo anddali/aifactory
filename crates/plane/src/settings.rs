@@ -36,6 +36,16 @@ pub struct Settings {
     pub egress_proxy_url: Option<String>,
     /// Reconciliation polling interval for ticket sources and repo hosts.
     pub poll_secs: u64,
+    /// Entra group → role mappings applied at sign-in.
+    pub entra_group_roles: Vec<GroupRole>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupRole {
+    pub group: String,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    pub role: String,
 }
 
 impl Default for Settings {
@@ -80,6 +90,7 @@ impl Default for Settings {
             max_launch_attempts: 5,
             egress_proxy_url: None,
             poll_secs: 60,
+            entra_group_roles: vec![],
         }
     }
 }

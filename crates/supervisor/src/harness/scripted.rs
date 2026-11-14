@@ -302,13 +302,19 @@ impl Harness for Scripted {
     async fn run_turn(&mut self, ctx: TurnCtx<'_>, input: TurnInput) -> Result<TurnOutcome> {
         self.load(ctx.ws);
         let _ = ctx.events.send(HarnessEvent::ModelTurn { model: Some("scripted".into()), text: Some(format!("{:?} input", input.kind)) });
-        if fault("hang_turn") {
+        if fault("hang_turn") || (fault("hang_start") && input.kind == InputKind::Start) {
             let mut rx = ctx.interrupt.clone();
             let _ = rx.wait_for(|v| *v).await;
             return Ok(TurnOutcome::Interrupted);
         }
         let workflow = ctx.ws.spec.workflow;
         let mut s = Step { ctx: &ctx, input: &input, n: 0 };
+        if std::env::var("FACTORY_SCRIPTED_FAULT").ok().as_deref() == Some("loop_calls") && input.kind != InputKind::Start {
+            // Stuck agent: the same call over and over.
+            for _ in 0..8 {
+                let _ = s.call("repo.read_file", json!({"path": "README.md"})).await;
+            }
+        }
         let r = match workflow {
             WorkflowKind::TicketBuild => self.ticket_build(&mut s).await,
             WorkflowKind::PrReview => self.pr_review(&mut s).await,

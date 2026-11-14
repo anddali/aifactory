@@ -84,7 +84,7 @@ impl Launcher for ProcessLauncher {
         let mut cmd = tokio::process::Command::new(&self.supervisor_bin);
         cmd.env_clear();
         // Only what git and the OS need, plus the runner's own variables.
-        for k in ["PATH", "SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP", "LANG"] {
+        for k in ["PATH", "SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP", "LANG", "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "FACTORY_COPILOT_BIN"] {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);
             }

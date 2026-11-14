@@ -3,7 +3,8 @@
 //! Verified against Copilot CLI 1.0.x:
 //! - BYOK through `COPILOT_PROVIDER_BASE_URL` / `COPILOT_PROVIDER_API_KEY` /
 //!   `COPILOT_MODEL`, with `COPILOT_OFFLINE=true` so no GitHub sign-in or
-//!   GitHub traffic is involved;
+//!   GitHub traffic is involved (offline mode also disables auto-update, so the
+//!   pinned CLI version in the image is the one that runs);
 //! - headless turns with `-p <prompt> --allow-all-tools --no-ask-user`;
 //! - `--output-format=json` JSONL events (`assistant.message`,
 //!   `tool.execution_start`, `tool.execution_complete`, `assistant.turn_end`);
@@ -30,6 +31,31 @@ const SID: &str = "copilot-session-id";
 
 pub fn binary() -> String {
     std::env::var("FACTORY_COPILOT_BIN").unwrap_or_else(|_| "copilot".into())
+}
+
+/// Program and leading arguments that start the Copilot CLI. On Windows the
+/// npm shim is a batch file, which cannot carry multi-line prompts, so the
+/// CLI's node entry point is run directly.
+pub fn launcher() -> (String, Vec<String>) {
+    let bin = binary();
+    if bin.ends_with(".js") {
+        return ("node".into(), vec![bin]);
+    }
+    if cfg!(windows) && !bin.ends_with(".exe") {
+        let dirs = std::env::var("PATH").unwrap_or_default();
+        let candidates: Vec<std::path::PathBuf> = if bin.contains(['\\', '/']) {
+            vec![std::path::PathBuf::from(&bin).parent().map(|p| p.to_path_buf()).unwrap_or_default()]
+        } else {
+            std::env::split_paths(&dirs).collect()
+        };
+        for d in candidates {
+            let loader = d.join("node_modules").join("@github").join("copilot").join("npm-loader.js");
+            if loader.exists() {
+                return ("node".into(), vec![loader.to_string_lossy().into_owned()]);
+            }
+        }
+    }
+    (bin, vec![])
 }
 
 fn factory_bin() -> String {
@@ -91,19 +117,20 @@ impl Copilot {
     }
 
     pub fn command(&self, ws: &Workspace, prompt: &str, mcp: &std::path::Path) -> Command {
-        let mut c = Command::new(binary());
+        let (prog, pre) = launcher();
+        let mut c = Command::new(prog);
+        c.args(pre);
         let sid = self.session_id.clone().unwrap_or_default();
         c.current_dir(&ws.repo)
             .arg("-p")
             .arg(prompt)
-            .args(["--allow-all-tools", "--no-ask-user", "--output-format=json", "--no-auto-update", "--disable-builtin-mcps", "--no-color"])
+            .args(["--allow-all-tools", "--no-ask-user", "--output-format=json", "--disable-builtin-mcps", "--no-color"])
             .arg(format!("--resume={sid}"))
             .arg(format!("--additional-mcp-config=@{}", mcp.display()))
             .arg("--secret-env-vars=FACTORY_RUN_TOKEN,COPILOT_PROVIDER_API_KEY")
             .arg(format!("--model={}", ws.spec.model.model))
             .env("COPILOT_HOME", ws.session.join(HOME))
             .env("COPILOT_OFFLINE", "true")
-            .env("COPILOT_AUTO_UPDATE", "false")
             .env("COPILOT_PROVIDER_BASE_URL", &ws.spec.model.base_url)
             .env("COPILOT_PROVIDER_API_KEY", &ws.spec.model.api_key)
             .env("COPILOT_PROVIDER_TYPE", "openai")
@@ -139,7 +166,8 @@ impl Harness for Copilot {
             }
         };
         self.session_id = Some(sid);
-        let o = Command::new(binary()).arg("--version").output().await.with_context(|| format!("{} is not installed", binary()))?;
+        let (prog, pre) = launcher();
+        let o = Command::new(&prog).args(&pre).arg("--version").output().await.with_context(|| format!("{} is not installed", binary()))?;
         if !o.status.success() {
             bail!("copilot --version failed");
         }
