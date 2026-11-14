@@ -13,5 +13,5 @@ if [ "${FACTORY_DOCKER_IMAGES:-0}" = "1" ]; then
 fi
 cargo build --workspace
 cargo test --workspace --no-fail-fast
-(cd portal && npm ci --no-audit --no-fund && npm test && npm run build)
+(cd portal && if [ -d node_modules ]; then npm install --no-audit --no-fund; else npm ci --no-audit --no-fund; fi && npm test && npm run build)
 echo "all tests passed"

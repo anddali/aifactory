@@ -100,3 +100,32 @@ the end of each list.
   tokens only, so cost is metered at the plane's model endpoint, not from harness events.
 - **Fake model provider** is served by the plane at `/fake-model/v1` and requires a fixed provider key, proving that
   the plane adds the provider key and the runner's run key is not forwarded.
+
+## Phase 2 and 3 additions
+
+- **LiteLLM keys.** One virtual key per run at run start (and again on revival), with `max_budget` = remaining
+  budget, `models` = the run's model only, and a `duration` of twice the project's idle expiry plus a day. The
+  plane deletes it at run end after reading `key/info` spend; the difference between LiteLLM's spend and what the
+  plane tracked is recorded as a `litellm_reconciliation` usage entry, so per-run, per-model and per-project totals
+  match LiteLLM. The key is stored encrypted on the run row. Creation is idempotent per run and issue count.
+- **Harness-reported usage** is informational in direct mode (the plane meters at its endpoint, which also sees
+  input tokens that Copilot does not report). With LiteLLM it is the running estimate until reconciliation.
+- **Egress proxy** is a separate small binary (`egress`) sharing the plane crate. It is an HTTP forward proxy
+  (CONNECT and absolute-form) checking the host against `settings.egress_allowlist` (an entry allows the domain
+  and its subdomains; IP literals are not allowed unless listed), and a reverse proxy at `/feeds/<name>/` for
+  private package feeds, which are `package_feed` connectors whose `auth_header` secret the proxy adds. It
+  reloads its policy from the database every 5 s.
+- **Entra.** Authorization-code flow; the ID token's issuer, audience, expiry and nonce are validated, its
+  signature is not, because it is received directly from the token endpoint over TLS (OIDC Core 3.1.3.7). Groups
+  map to roles through the `entra_group_roles` setting; Entra-sourced grants are replaced at every sign-in while
+  manual grants stay. Group overage (more than 200 groups, `_claim_names`) is not handled yet.
+- **Roles are ordered** view < operate < approve < administer; a global administrator has every role.
+- **No-progress detection** counts a turn as progress when it pushed code or made a side-effecting primitive call
+  other than status reports, messages and questions.
+- **Fargate launcher** uses `startedBy` (derived from run and generation, ≤ 36 chars) for idempotency and one task
+  definition per stack image; runner tasks have no task role, so they hold no AWS credentials.
+- **Copilot CLI on Windows** is started through its node entry point rather than the npm batch shim, which cannot
+  carry multi-line prompts. `FACTORY_COPILOT_BIN` may point at a binary or a `.js` entry point.
+- **Fake services served by the plane.** `/fake-model/v1` (OpenAI-compatible) and `/fake-litellm` are always
+  mounted (they are inert without configuration); `/fake-entra` and `/api/fake/...` only with the development
+  sign-in enabled.

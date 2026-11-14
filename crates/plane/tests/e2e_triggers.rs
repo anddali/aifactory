@@ -128,3 +128,43 @@ async fn interrupt_now_stops_the_turn_and_kill_switch_pauses_everything() {
     env.post(&format!("/api/runs/{id}/resume"), json!({})).await;
     env.wait_state(id, "waiting", None, 30).await;
 }
+
+fn hmac_hex(key: &str, msg: &[u8]) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut m = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.as_bytes()).unwrap();
+    m.update(msg);
+    hex::encode(m.finalize().into_bytes())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webhooks_verify_signatures() {
+    let env = Env::new(Opts::default()).await;
+    // GitHub
+    let gh = env.connector("github", json!({"api_url": "http://127.0.0.1:1"})).await;
+    env.put(&format!("/api/connectors/{gh}/secrets"), json!({"secrets": {"webhook_secret": "whsec-test", "token": "ghp_x"}})).await;
+    let body = json!({"action": "opened", "number": 7, "pull_request": {"number": 7, "title": "t", "state": "open", "html_url": "https://github.com/acme/w/pull/7", "user": {"login": "dev"}, "head": {"ref": "feature", "sha": "abc"}, "base": {"ref": "main"}}, "repository": {"full_name": "acme/w"}, "sender": {"login": "dev"}}).to_string();
+    let url = format!("{}/webhooks/github/{gh}", env.url());
+    let ok = env.http.post(&url).header("x-github-event", "pull_request").header("x-github-delivery", "d-1")
+        .header("x-hub-signature-256", format!("sha256={}", hmac_hex("whsec-test", body.as_bytes()))).body(body.clone()).send().await.unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    let v: serde_json::Value = ok.json().await.unwrap();
+    assert!(v["accepted"].as_u64().unwrap() >= 1, "{v}");
+    let bad = env.http.post(&url).header("x-github-event", "pull_request").header("x-hub-signature-256", "sha256=00").body(body.clone()).send().await.unwrap();
+    assert_eq!(bad.status().as_u16(), 401);
+    let none = env.http.post(&url).header("x-github-event", "pull_request").body(body).send().await.unwrap();
+    assert_eq!(none.status().as_u16(), 401);
+    // Slack: signed URL verification is answered, an unsigned one is refused.
+    let sl = env.connector("slack", json!({"api_url": "http://127.0.0.1:1"})).await;
+    env.put(&format!("/api/connectors/{sl}/secrets"), json!({"secrets": {"signing_secret": "slack-signing", "bot_token": "xoxb-test-token-1234"}})).await;
+    let body = json!({"type": "url_verification", "challenge": "abc123"}).to_string();
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = format!("v0={}", hmac_hex("slack-signing", format!("v0:{ts}:{body}").as_bytes()));
+    let url = format!("{}/webhooks/slack/{sl}", env.url());
+    let r = env.http.post(&url).header("x-slack-request-timestamp", &ts).header("x-slack-signature", sig).header("content-type", "application/json").body(body.clone()).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()["challenge"], "abc123");
+    let r = env.http.post(&url).header("x-slack-request-timestamp", &ts).header("x-slack-signature", "v0=bad").body(body).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let m = env.http.get(format!("{}/metrics", env.url())).send().await.unwrap().text().await.unwrap();
+    assert!(m.contains("webhook_signature"));
+}

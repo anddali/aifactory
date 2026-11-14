@@ -1,8 +1,12 @@
 //! Connector roles and the registry that builds a connector from its stored
 //! configuration and decrypted secrets.
 
+pub mod ado;
 pub mod fake;
+pub mod github;
+pub mod jira;
 pub mod model;
+pub mod slack;
 
 use crate::AppState;
 use anyhow::{Result, anyhow, bail};
@@ -292,12 +296,13 @@ pub const KINDS: &[KindInfo] = &[
     KindInfo { kind: "jira", role: "ticket", config_fields: &["base_url", "email", "project_keys", "webhook_path"], secret_fields: &["api_token", "webhook_secret"] },
     KindInfo { kind: "fake_repo", role: "repo", config_fields: &["root", "protected"], secret_fields: &[] },
     KindInfo { kind: "github", role: "repo", config_fields: &["api_url", "owner"], secret_fields: &["token", "webhook_secret"] },
-    KindInfo { kind: "azure_devops", role: "repo", config_fields: &["org_url", "project"], secret_fields: &["pat"] },
+    KindInfo { kind: "azure_devops", role: "repo", config_fields: &["org_url", "project"], secret_fields: &["pat", "webhook_secret"] },
     KindInfo { kind: "fake_chat", role: "chat", config_fields: &[], secret_fields: &[] },
     KindInfo { kind: "slack", role: "chat", config_fields: &["api_url"], secret_fields: &["bot_token", "signing_secret"] },
     KindInfo { kind: "fake_model", role: "model", config_fields: &["base_url"], secret_fields: &["api_key"] },
     KindInfo { kind: "direct_model", role: "model", config_fields: &["base_url"], secret_fields: &["api_key"] },
     KindInfo { kind: "litellm", role: "model", config_fields: &["base_url", "runner_base_url"], secret_fields: &["master_key"] },
+    KindInfo { kind: "package_feed", role: "feed", config_fields: &["name", "upstream"], secret_fields: &["auth_header"] },
 ];
 
 pub fn kind_info(kind: &str) -> Option<&'static KindInfo> {
@@ -358,7 +363,7 @@ pub async fn ticket_source(state: &AppState, id: Uuid) -> Result<Arc<dyn TicketS
     let l = load(state, id).await?;
     Ok(match l.row.kind.as_str() {
         "fake_tickets" => Arc::new(fake::FakeTickets::new(state.pool.clone(), l.row.id)),
-        "jira" => bail!("jira connector is not available yet"),
+        "jira" => Arc::new(jira::Jira::from_loaded(&l)?),
         k => bail!("connector kind {k} is not a ticket source"),
     })
 }
@@ -367,7 +372,8 @@ pub async fn repo_host(state: &AppState, id: Uuid) -> Result<Arc<dyn RepoHost>> 
     let l = load(state, id).await?;
     Ok(match l.row.kind.as_str() {
         "fake_repo" => Arc::new(fake::FakeRepo::from_loaded(state.pool.clone(), &l)?),
-        "github" | "azure_devops" => bail!("{} connector is not available yet", l.row.kind),
+        "github" => Arc::new(github::GitHub::from_loaded(&l)?),
+        "azure_devops" => Arc::new(ado::AzureDevOps::from_loaded(&l)?),
         k => bail!("connector kind {k} is not a repo host"),
     })
 }
@@ -376,7 +382,7 @@ pub async fn chat(state: &AppState, id: Uuid) -> Result<Arc<dyn Chat>> {
     let l = load(state, id).await?;
     Ok(match l.row.kind.as_str() {
         "fake_chat" => Arc::new(fake::FakeChat::new(state.pool.clone(), l.row.id)),
-        "slack" => bail!("slack connector is not available yet"),
+        "slack" => Arc::new(slack::Slack::from_loaded(&l)?),
         k => bail!("connector kind {k} is not a chat connector"),
     })
 }
@@ -399,6 +405,7 @@ pub async fn test(state: &AppState, id: Uuid) -> Result<String> {
         "repo" => repo_host(state, id).await?.test_connection().await,
         "chat" => chat(state, id).await?.test_connection().await,
         "model" => model::test_connection(state, &l).await,
+        "feed" => Ok("feed credentials stored; used by the egress proxy".into()),
         r => bail!("unknown role {r}"),
     }
 }
