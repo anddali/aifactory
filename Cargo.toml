@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/client", "crates/plane", "crates/supervisor", "crates/factory-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+proto = { path = "crates/proto", package = "factory-proto" }
+client = { path = "crates/client", package = "factory-client" }
+tokio = { version = "1.54", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1.29", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query"] }
+futures = "0.3"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+clap = { version = "4.6", features = ["derive", "env"] }
+regex = "1"
+bytes = "1"
+tempfile = "3"
+
+[profile.dev]
+debug = 1
+[profile.dev.package."*"]
+opt-level = 1

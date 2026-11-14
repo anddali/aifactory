@@ -1,0 +1,6 @@
+/target
+node_modules/
+/portal/dist
+*.log
+/.factory-data
+.env

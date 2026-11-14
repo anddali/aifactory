@@ -1,0 +1,16 @@
+[package]
+name = "factory-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+proto.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
