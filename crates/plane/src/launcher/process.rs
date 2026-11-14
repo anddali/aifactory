@@ -21,7 +21,9 @@ impl ProcessLauncher {
                     .and_then(|p| p.parent().map(|d| d.join(exe_name)))
                     .unwrap_or_else(|| PathBuf::from(exe_name))
             });
-        ProcessLauncher { supervisor_bin, root: data_dir.join("runners") }
+        // Absolute, because the runner is started inside its own work directory.
+        let root = std::path::absolute(data_dir).unwrap_or_else(|_| data_dir.to_path_buf()).join("runners");
+        ProcessLauncher { supervisor_bin, root }
     }
 }
 

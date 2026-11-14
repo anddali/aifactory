@@ -58,7 +58,7 @@ export function VirtualList<T>({
   // estimated offsets alone undershoot the true end.
   const stickRef = useRef(true);
   // Geometry right after our last pin, to tell a user scroll apart from growth.
-  const pinned = useRef<{ top: number; height: number } | null>(null);
+  const pinned = useRef<{ top: number; height: number; client: number } | null>(null);
   const totalSize = virtualizer.getTotalSize();
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -67,16 +67,32 @@ export function VirtualList<T>({
       const p = pinned.current;
       // If the position moved away from where we pinned it (and is no longer
       // at the old end), the user scrolled before the scroll event reached us.
-      const userMoved = p !== null && Math.abs(el.scrollTop - p.top) > 2 && el.scrollTop + el.clientHeight < p.height - END_THRESHOLD;
+      // A change of viewport height (e.g. a card above the list disappearing)
+      // moves scrollTop too; that is not the user scrolling.
+      const userMoved = p !== null && p.client === el.clientHeight && Math.abs(el.scrollTop - p.top) > 2 && el.scrollTop + el.clientHeight < p.height - END_THRESHOLD;
       if (userMoved) {
         stickRef.current = false;
       } else {
         el.scrollTop = el.scrollHeight;
-        pinned.current = { top: el.scrollTop, height: el.scrollHeight };
+        pinned.current = { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight };
       }
     }
     initialScrollDone.current = true;
   }, [items.length, totalSize]);
+
+  // Keep the pin when the viewport itself is resized.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      if (stickRef.current) {
+        el.scrollTop = el.scrollHeight;
+        pinned.current = { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight };
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Count items that arrived at the tail while scrolled away.
   useEffect(() => {
@@ -93,7 +109,7 @@ export function VirtualList<T>({
     if (!el) return;
     const end = el.scrollHeight - el.scrollTop - el.clientHeight <= END_THRESHOLD;
     stickRef.current = end;
-    if (end) pinned.current = { top: el.scrollTop, height: el.scrollHeight };
+    if (end) pinned.current = { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight };
     setAtEnd(end);
     if (end) setUnseen(0);
     if (el.scrollTop < LOAD_OLDER_THRESHOLD && hasMore && !loadingOlder && initialScrollDone.current) onLoadOlder?.();
@@ -112,7 +128,7 @@ export function VirtualList<T>({
     const el = scrollRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
-      pinned.current = { top: el.scrollTop, height: el.scrollHeight };
+      pinned.current = { top: el.scrollTop, height: el.scrollHeight, client: el.clientHeight };
     }
     setAtEnd(true);
     setUnseen(0);

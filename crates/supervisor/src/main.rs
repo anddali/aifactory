@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
     let harness_name = std::env::var("FACTORY_HARNESS").unwrap_or_else(|_| "scripted".into());
     let root = PathBuf::from(std::env::var("FACTORY_WORKDIR").unwrap_or_else(|_| "/workspace".into()));
     std::fs::create_dir_all(&root)?;
+    let root = std::path::absolute(&root)?;
     let hello = client
         .hello(&HelloRequest { generation, harness: harness_name.clone(), image: std::env::var("FACTORY_IMAGE").ok() })
         .await
@@ -128,6 +129,26 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let spec = hello.spec;
+    // Heartbeats start at once: workspace setup can take a while.
+    let busy = Arc::new(AtomicBool::new(false));
+    {
+        let client = client.clone();
+        let busy = busy.clone();
+        let every = Duration::from_secs(spec.heartbeat_secs.max(1));
+        tokio::spawn(async move {
+            loop {
+                match client.heartbeat(&Heartbeat { generation, busy: busy.load(Ordering::Relaxed), current_input: None }).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!("plane rejected heartbeat (stale generation); exiting");
+                        std::process::exit(0);
+                    }
+                    Err(e) => tracing::warn!("heartbeat failed: {e:#}"),
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
+    }
     let (events, pump) = spawn_pump(client.clone(), generation);
     let ws = Workspace::new(root, client.clone(), spec.clone());
 
@@ -178,26 +199,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    let busy = Arc::new(AtomicBool::new(false));
-    // Heartbeats.
-    {
-        let client = client.clone();
-        let busy = busy.clone();
-        let every = Duration::from_secs(spec.heartbeat_secs.max(1));
-        tokio::spawn(async move {
-            loop {
-                match client.heartbeat(&Heartbeat { generation, busy: busy.load(Ordering::Relaxed), current_input: None }).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!("plane rejected heartbeat (stale generation); exiting");
-                        std::process::exit(0);
-                    }
-                    Err(e) => tracing::warn!("heartbeat failed: {e:#}"),
-                }
-                tokio::time::sleep(every).await;
-            }
-        });
-    }
     // Instruction poller.
     let (itx, mut irx) = mpsc::unbounded_channel::<InstructionEnvelope>();
     {
