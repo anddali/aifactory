@@ -1,0 +1,6 @@
+FROM ai-factory/runner-base:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pip pipx && rm -rf /var/lib/apt/lists/*
+USER agent
+RUN pipx install uv && pipx install ruff && pipx install pytest
+ENV PATH=/home/agent/.local/bin:$PATH FACTORY_IMAGE=python

@@ -98,10 +98,12 @@ impl Launcher for ProcessLauncher {
         cmd.stdout(log).stderr(log2).stdin(std::process::Stdio::null()).current_dir(&work);
         #[cfg(windows)]
         {
-            // Detach so the runner survives the plane process being killed.
+            // Own process group (no Ctrl+C from the plane's console) and a
+            // hidden console that git and other children inherit. The runner
+            // survives the plane process being killed.
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
         }
         #[cfg(unix)]
         {

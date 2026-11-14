@@ -1,0 +1,95 @@
+# Local development and tests. Everything external is faked; no credentials needed.
+#
+#   docker compose up -d postgres            # just the database (for `cargo test`)
+#   docker compose --profile images build    # runner images
+#   docker compose up -d                     # plane x2 + egress proxy + postgres
+#
+# Runners started by the Docker launcher join the internal `runners` network,
+# which has no route to the internet; they reach only the planes and the
+# egress proxy.
+name: ai-factory
+
+x-plane: &plane
+  build: { context: ., dockerfile: docker/Dockerfile.plane }
+  image: ai-factory/plane:latest
+  depends_on: { postgres: { condition: service_healthy } }
+  environment: &plane-env
+    DATABASE_URL: postgres://factory:factory@postgres:5432/factory
+    # Development key only. Production supplies its own from a secret store.
+    FACTORY_ENCRYPTION_KEYS: k1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+    FACTORY_BOOTSTRAP_ADMIN: admin@example.test
+    FACTORY_DEV_LOGIN: "1"
+    FACTORY_PUBLIC_URLS: http://plane-a:8080,http://plane-b:8080
+    FACTORY_DOCKER_NETWORK: ai-factory_runners
+    FACTORY_IMAGE_PREFIX: ai-factory/runner-
+  volumes:
+    - fake-repos:/var/lib/factory/fake-repos
+    - /var/run/docker.sock:/var/run/docker.sock
+  networks: [default, runners]
+
+services:
+  postgres:
+    image: postgres:17
+    environment: { POSTGRES_USER: factory, POSTGRES_PASSWORD: factory, POSTGRES_DB: factory }
+    ports: ["55432:5432"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U factory"], interval: 2s, retries: 30 }
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  plane-a:
+    <<: *plane
+    environment: { <<: *plane-env, FACTORY_REPLICA_ID: plane-a }
+    ports: ["8080:8080"]
+
+  plane-b:
+    <<: *plane
+    environment: { <<: *plane-env, FACTORY_REPLICA_ID: plane-b }
+    ports: ["8081:8080"]
+
+  egress:
+    image: ai-factory/plane:latest
+    entrypoint: ["/usr/local/bin/egress"]
+    environment:
+      DATABASE_URL: postgres://factory:factory@postgres:5432/factory
+      FACTORY_ENCRYPTION_KEYS: k1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+      FACTORY_EGRESS_LISTEN: 0.0.0.0:3128
+    depends_on: { postgres: { condition: service_healthy } }
+    networks: [default, runners]
+
+  # Runner images (built, never started by compose; the plane launches them).
+  runner-base:
+    profiles: [images]
+    build: { context: ., dockerfile: docker/runner/Dockerfile.base }
+    image: ai-factory/runner-base:latest
+  runner-python:
+    profiles: [images]
+    build: { context: docker/runner, dockerfile: Dockerfile.python }
+    image: ai-factory/runner-python:latest
+    depends_on: [runner-base]
+  runner-node:
+    profiles: [images]
+    build: { context: docker/runner, dockerfile: Dockerfile.node }
+    image: ai-factory/runner-node:latest
+    depends_on: [runner-base]
+  runner-rust:
+    profiles: [images]
+    build: { context: docker/runner, dockerfile: Dockerfile.rust }
+    image: ai-factory/runner-rust:latest
+    depends_on: [runner-base]
+  runner-dotnet:
+    profiles: [images]
+    build: { context: docker/runner, dockerfile: Dockerfile.dotnet }
+    image: ai-factory/runner-dotnet:latest
+    depends_on: [runner-base]
+  runner-polyglot:
+    profiles: [images]
+    build: { context: docker/runner, dockerfile: Dockerfile.polyglot }
+    image: ai-factory/runner-polyglot:latest
+    depends_on: [runner-base]
+
+networks:
+  runners:
+    internal: true
+
+volumes:
+  pgdata:
+  fake-repos:

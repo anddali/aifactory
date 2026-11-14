@@ -1,0 +1,11 @@
+# All four stacks.
+FROM ai-factory/runner-base:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-pip pipx && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && chmod +x /tmp/dotnet-install.sh \
+    && /tmp/dotnet-install.sh --channel 8.0 --install-dir /usr/share/dotnet && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet
+USER agent
+RUN pipx install uv && pipx install ruff && pipx install pytest \
+    && mise use --global node@22 \
+    && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
+ENV PATH=/home/agent/.cargo/bin:/home/agent/.local/bin:$PATH DOTNET_CLI_TELEMETRY_OPTOUT=1 FACTORY_IMAGE=polyglot

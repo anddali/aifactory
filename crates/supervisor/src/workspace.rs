@@ -38,7 +38,10 @@ impl Workspace {
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_COUNT", "4")
+            .env("GCM_INTERACTIVE", "never")
+            .env("GIT_CONFIG_COUNT", "5")
+            .env("GIT_CONFIG_KEY_4", "credential.helper")
+            .env("GIT_CONFIG_VALUE_4", "")
             .env("GIT_CONFIG_KEY_0", "http.extraHeader")
             .env("GIT_CONFIG_VALUE_0", format!("Authorization: Bearer {}", self.client.token()))
             .env("GIT_CONFIG_KEY_1", "user.name")
@@ -66,7 +69,7 @@ impl Workspace {
     pub async fn git_env(&self, args: &[&str], env: &[(&str, String)]) -> Result<String> {
         let o = self.git_in(&self.repo, args, env).await?;
         if o.status != 0 {
-            bail!("git {} failed: {}", args.join(" "), o.stderr);
+            bail!("git {} failed (exit {}): {} {}", args.join(" "), o.status, o.stderr, o.stdout);
         }
         Ok(o.stdout)
     }

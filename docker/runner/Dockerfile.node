@@ -1,0 +1,4 @@
+FROM ai-factory/runner-base:latest
+USER agent
+RUN mise use --global node@22 && mise exec -- npm install -g pnpm yarn eslint typescript
+ENV FACTORY_IMAGE=node

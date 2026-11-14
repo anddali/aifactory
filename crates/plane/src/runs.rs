@@ -163,6 +163,11 @@ pub async fn transition(
            pause_reason = CASE WHEN $2 = 'paused' THEN $4 ELSE NULL END,
            finished_at = CASE WHEN $5 THEN now() ELSE finished_at END,
            expired_at = CASE WHEN $2 = 'expired' THEN now() WHEN $2 = 'waiting' THEN NULL ELSE expired_at END,
+           -- The idle clock starts when the run starts waiting: time spent in
+           -- turns never counts towards expiry.
+           last_activity_at = CASE WHEN $2 IN ('waiting','paused') AND state NOT IN ('waiting','paused') THEN now() ELSE last_activity_at END,
+           reminder_sent_at = CASE WHEN $2 IN ('waiting','paused') AND state NOT IN ('waiting','paused') THEN NULL ELSE reminder_sent_at END,
+           warning_sent_at = CASE WHEN $2 IN ('waiting','paused') AND state NOT IN ('waiting','paused') THEN NULL ELSE warning_sent_at END,
            updated_at = now()
          WHERE id=$1",
     )

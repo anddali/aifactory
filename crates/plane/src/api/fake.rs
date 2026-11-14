@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/fake/{cid}/pr", post(get_pr))
         .route("/api/fake/{cid}/chat/messages", get(chat_messages))
         .route("/api/fake/{cid}/chat/reply", post(chat_reply))
+        .route("/api/fake/{cid}/chat/redeliver", post(chat_redeliver))
 }
 
 async fn fake_repo(state: &AppState, cid: Uuid) -> ApiResult<FakeRepo> {
@@ -229,4 +230,11 @@ async fn chat_reply(State(state): State<AppState>, _u: User, Path(cid): Path<Uui
     let ev = ChatEvent { id: m.ts.clone(), channel, thread_ts: r.thread_ts, user: r.user, text: r.text, action: r.action };
     state.jobs.push(Job::ChatEvent { connector_id: cid, event: ev }, Some(format!("cev:{cid}:{}", m.ts))).await?;
     Ok(Json(json!({"ts": m.ts})))
+}
+
+/// Deliver a chat event with a given id again, as a retried webhook would.
+async fn chat_redeliver(State(state): State<AppState>, _u: User, Path(cid): Path<Uuid>, Json(ev): Json<ChatEvent>) -> ApiResult<Json<Value>> {
+    // No job-level idempotency key: only the plane's delivery de-duplication protects.
+    state.jobs.push(Job::ChatEvent { connector_id: cid, event: ev }, None).await?;
+    Ok(Json(json!({})))
 }

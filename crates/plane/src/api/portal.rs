@@ -82,7 +82,7 @@ async fn run_summary(state: &AppState, run: &Run, viewer: Option<&User>) -> ApiR
         "branch": run.branch, "assignee": assignee.map(|(id, e, n)| json!({"id": id, "email": e, "display_name": n})),
         "model": run.model, "harness": run.harness, "created_at": run.created_at, "updated_at": run.updated_at,
         "last_activity_at": run.last_activity_at, "outcome": run.outcome, "review_rounds": run.review_rounds,
-        "tokens_in": run.tokens_in, "tokens_out": run.tokens_out,
+        "tokens_in": run.tokens_in, "tokens_out": run.tokens_out, "expired_at": run.expired_at, "finished_at": run.finished_at,
     }))
 }
 

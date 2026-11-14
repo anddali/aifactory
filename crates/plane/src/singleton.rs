@@ -27,8 +27,12 @@ pub async fn run(state: AppState) {
                 if got {
                     tracing::info!(replica = %state.cfg.replica_id, "holding singleton duties");
                     loop {
+                        let t0 = std::time::Instant::now();
                         if let Err(e) = tick_once(&state).await {
                             tracing::warn!("singleton tick failed: {e:#}");
+                        }
+                        if t0.elapsed() > Duration::from_secs(2) {
+                            tracing::warn!(ms = t0.elapsed().as_millis() as u64, "slow singleton tick");
                         }
                         let tick = crate::settings::get(&state.pool).await.map(|s| s.tick_ms).unwrap_or(15000).max(100);
                         tokio::time::sleep(Duration::from_millis(tick)).await;
@@ -116,8 +120,13 @@ async fn idle_lifecycle(state: &AppState) -> Result<()> {
         let pc = engine::project_cfg(state, run.project_id).await?;
         let idle = (now - run.last_activity_at).num_seconds();
         let waiting_for = describe_wait(&run);
-        if idle >= pc.idle_expiry_secs {
-            engine::expire(state, &run).await?;
+        // Tiers fire in order: reminder, then warning, then expiry.
+        if idle >= pc.idle_reminder_secs && run.reminder_sent_at.is_none() {
+            let n = sqlx::query("UPDATE runs SET reminder_sent_at=now() WHERE id=$1 AND reminder_sent_at IS NULL").bind(run.id).execute(&state.pool).await?;
+            if n.rows_affected() > 0 {
+                events::append(&state.pool, &*state.blobs, run.id, "reminder_sent", None, json!({"waiting_for": waiting_for})).await?;
+                humans::notify(state, &run, &format!("reminder:{}:{}", run.id, run.last_activity_at.timestamp()), &format!("Reminder: this run is waiting for {waiting_for}.")).await?;
+            }
             continue;
         }
         if idle >= pc.idle_warning_secs && run.warning_sent_at.is_none() {
@@ -126,17 +135,13 @@ async fn idle_lifecycle(state: &AppState) -> Result<()> {
             if n.rows_affected() > 0 {
                 events::append(&state.pool, &*state.blobs, run.id, "warning_sent", None, json!({"expires_at": at})).await?;
                 humans::notify(state, &run, &format!("warning:{}:{}", run.id, run.last_activity_at.timestamp()), &format!(
-                    "This run is still waiting for {waiting_for}. It will expire at {} unless there is activity.", at.format("%Y-%m-%d %H:%M UTC")
+                    "This run is still waiting for {waiting_for}. It will expire at {} unless there is activity.", at.format("%Y-%m-%d %H:%M:%S UTC")
                 )).await?;
             }
             continue;
         }
-        if idle >= pc.idle_reminder_secs && run.reminder_sent_at.is_none() {
-            let n = sqlx::query("UPDATE runs SET reminder_sent_at=now() WHERE id=$1 AND reminder_sent_at IS NULL").bind(run.id).execute(&state.pool).await?;
-            if n.rows_affected() > 0 {
-                events::append(&state.pool, &*state.blobs, run.id, "reminder_sent", None, json!({"waiting_for": waiting_for})).await?;
-                humans::notify(state, &run, &format!("reminder:{}:{}", run.id, run.last_activity_at.timestamp()), &format!("Reminder: this run is waiting for {waiting_for}.")).await?;
-            }
+        if idle >= pc.idle_expiry_secs {
+            engine::expire(state, &run).await?;
         }
     }
     Ok(())

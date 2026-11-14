@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+# Base for every runner image: git, mise (tool-version manager), the supervisor,
+# the factory binary and the Copilot CLI harness. Stack images build FROM this.
+FROM rust:1.98-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY templates templates
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
+    cargo build --release -p factory-supervisor -p factory-cli && \
+    mkdir -p /out && cp target/release/supervisor target/release/factory /out/
+
+FROM debian:bookworm-slim
+ARG COPILOT_VERSION=1.0.36
+ARG MISE_VERSION=2026.11.1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates curl build-essential pkg-config libssl-dev unzip xz-utils jq ripgrep nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+# Tool-version manager used to install exact versions pinned by repositories.
+RUN curl -fsSL "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-x64" -o /usr/local/bin/mise \
+    && chmod +x /usr/local/bin/mise
+# The harness. Pinned; no GitHub sign-in is ever present in a runner.
+RUN npm install -g "@github/copilot@${COPILOT_VERSION}" && npm cache clean --force
+COPY --from=build /out/supervisor /usr/local/bin/supervisor
+COPY --from=build /out/factory /usr/local/bin/factory
+RUN useradd -m -u 10001 agent && mkdir -p /workspace && chown agent /workspace
+ENV FACTORY_WORKDIR=/workspace FACTORY_BIN=/usr/local/bin/factory MISE_DATA_DIR=/home/agent/.local/share/mise PATH=/home/agent/.local/share/mise/shims:$PATH
+USER agent
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/supervisor"]

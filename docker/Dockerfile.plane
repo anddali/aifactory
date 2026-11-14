@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.7
+# Control plane image: plane binary + built portal + git (for the git endpoint and fake repos).
+FROM node:24-bookworm-slim AS portal
+WORKDIR /src/portal
+COPY portal/package.json portal/package-lock.json ./
+RUN npm ci
+COPY portal/ ./
+RUN npm run build
+
+FROM rust:1.98-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY templates templates
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
+    cargo build --release -p factory-plane -p factory-supervisor -p factory-cli && \
+    mkdir -p /out && cp target/release/plane target/release/supervisor target/release/factory /out/
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/plane /usr/local/bin/plane
+COPY --from=build /out/supervisor /usr/local/bin/supervisor
+COPY --from=build /out/factory /usr/local/bin/factory
+COPY --from=portal /src/portal/dist /srv/portal
+ENV FACTORY_PORTAL_DIR=/srv/portal FACTORY_DATA_DIR=/var/lib/factory FACTORY_LISTEN_ADDR=0.0.0.0:8080
+RUN useradd -m -u 10001 factory && mkdir -p /var/lib/factory && chown factory /var/lib/factory
+USER factory
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/plane"]

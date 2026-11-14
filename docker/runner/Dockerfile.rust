@@ -1,0 +1,4 @@
+FROM ai-factory/runner-base:latest
+USER agent
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --component clippy,rustfmt
+ENV PATH=/home/agent/.cargo/bin:$PATH FACTORY_IMAGE=rust

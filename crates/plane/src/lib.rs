@@ -7,6 +7,7 @@ pub mod config;
 pub mod connectors;
 pub mod crypto;
 pub mod db;
+pub mod egress;
 pub mod engine;
 pub mod entra;
 pub mod humans;
