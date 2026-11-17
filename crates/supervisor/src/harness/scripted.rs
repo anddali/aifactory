@@ -19,6 +19,8 @@ struct State {
     pr_number: Option<i64>,
     handled_threads: Vec<String>,
     notes: Vec<String>,
+    #[serde(default)]
+    plan_versions: u32,
 }
 
 #[derive(Default)]
@@ -114,6 +116,49 @@ impl Scripted {
         Ok(())
     }
 
+    /// Plan phase: submit (or resubmit with the reviewer's feedback) the plan and end the turn.
+    async fn submit_plan(&mut self, s: &mut Step<'_, '_>, key: &str, feedback: Option<&str>) -> Result<()> {
+        self.state.plan_versions += 1;
+        let v = self.state.plan_versions;
+        let mut plan = format!(
+            "## Understanding\n{key} asks for a documented change.\n\n## Approach\nAdd docs/changes/{}.md describing the change and wire it in.\n\n## Changes\n- docs/changes/{}.md\n\n## Tests\nThe existing checks.\n\n## Size\nSmall.\n",
+            slug(key),
+            slug(key)
+        );
+        if let Some(f) = feedback.filter(|f| !f.is_empty()) {
+            plan.push_str(&format!("\n## Revised (v{v})\nAddressed: {f}\n"));
+        }
+        s.call("plan.submit", json!({"plan": plan, "summary": format!("Plan v{v}: add docs/changes/{}.md", slug(key))})).await?;
+        self.state.phase = "planned".into();
+        Ok(())
+    }
+
+    /// Build phase: implement, push and open the PR.
+    async fn build(&mut self, s: &mut Step<'_, '_>, key: Option<String>) -> Result<()> {
+        self.state.phase = "building".into();
+        if s.input.kind == InputKind::Steer {
+            self.state.notes.push(s.input.text.clone());
+        }
+        let k = key.unwrap_or_else(|| "change".into());
+        let rel = format!("docs/changes/{}.md", slug(&k));
+        s.write(&rel, &format!("# {k}\n\nImplemented by the factory.\n\nDirection agreed: {}\n", s.input.text.lines().next().unwrap_or("")))?;
+        for note in &self.state.notes {
+            s.append(&rel, &format!("- steering: {note}"))?;
+        }
+        s.commit_push(&format!("{k}: implement change")).await?;
+        if fault("crash_after_push") {
+            eprintln!("scripted fault: crashing after push");
+            std::process::exit(137);
+        }
+        let pr = s.call("pr.open", json!({"title": format!("{k}: implement change"), "body": "Implements the ticket as agreed with the assignee."})).await?;
+        let n = pr["number"].as_i64();
+        self.state.pr_number = n;
+        s.call("status.artifact", json!({"kind": "pr", "title": format!("PR #{}", n.unwrap_or(0)), "url": pr["url"]})).await?;
+        s.say(format!("Opened PR #{}", n.unwrap_or(0)));
+        self.state.phase = "pr_open".into();
+        Ok(())
+    }
+
     async fn ticket_build(&mut self, s: &mut Step<'_, '_>) -> Result<()> {
         let key = s.input.data.get("ticket_key").and_then(|v| v.as_str()).map(String::from);
         match s.input.kind {
@@ -124,30 +169,21 @@ impl Scripted {
                 let title = t["title"].as_str().unwrap_or("").to_string();
                 s.say(format!("Researched {}: {title}. The repository has {n} files.", t["key"].as_str().unwrap_or("")));
                 s.call("status.report", json!({"text": format!("Research done for {title}")})).await?;
-                s.call("human.ask", json!({"question": format!("Plan for {}: add docs/changes/{}.md describing the change and wire it in. OK to proceed?", t["key"].as_str().unwrap_or(""), slug(t["key"].as_str().unwrap_or("change")))})).await?;
-                self.state.phase = "asked".into();
+                let k = t["key"].as_str().unwrap_or("change").to_string();
+                self.submit_plan(s, &k, None).await?;
             }
-            InputKind::Answer | InputKind::Approval | InputKind::Steer | InputKind::Other | InputKind::CapDecision if self.state.pr_number.is_none() => {
-                if s.input.kind == InputKind::Steer {
-                    self.state.notes.push(s.input.text.clone());
-                }
+            // Build: after the plan was approved (or once building, e.g. a cap decision).
+            InputKind::Approval if self.state.pr_number.is_none() => {
+                self.build(s, key).await?;
+            }
+            InputKind::Answer | InputKind::Steer | InputKind::Other | InputKind::CapDecision if self.state.pr_number.is_none() && self.state.phase == "building" => {
+                self.build(s, key).await?;
+            }
+            // Plan phase: requested changes, a reminder or steering (re)submit the plan.
+            InputKind::Answer | InputKind::Steer | InputKind::Other if self.state.pr_number.is_none() => {
                 let k = key.unwrap_or_else(|| "change".into());
-                let rel = format!("docs/changes/{}.md", slug(&k));
-                s.write(&rel, &format!("# {k}\n\nImplemented by the factory.\n\nDirection agreed: {}\n", s.input.text.lines().next().unwrap_or("")))?;
-                for note in &self.state.notes {
-                    s.append(&rel, &format!("- steering: {note}"))?;
-                }
-                s.commit_push(&format!("{k}: implement change")).await?;
-                if fault("crash_after_push") {
-                    eprintln!("scripted fault: crashing after push");
-                    std::process::exit(137);
-                }
-                let pr = s.call("pr.open", json!({"title": format!("{k}: implement change"), "body": "Implements the ticket as agreed with the assignee."})).await?;
-                let n = pr["number"].as_i64();
-                self.state.pr_number = n;
-                s.call("status.artifact", json!({"kind": "pr", "title": format!("PR #{}", n.unwrap_or(0)), "url": pr["url"]})).await?;
-                s.say(format!("Opened PR #{}", n.unwrap_or(0)));
-                self.state.phase = "pr_open".into();
+                let feedback = s.input.text.lines().find(|l| !l.trim().is_empty() && !l.contains("asked for changes")).unwrap_or("").to_string();
+                self.submit_plan(s, &k, Some(&feedback)).await?;
             }
             InputKind::Review | InputKind::Push => {
                 let pr = s.call("pr.get", json!({})).await?;
@@ -255,9 +291,18 @@ impl Scripted {
                     format!("# Report\n\nThe repository has {} files. Proposed change: add a CONTRIBUTING note.\n", files["files"].as_array().map(|a| a.len()).unwrap_or(0))
                 };
                 s.call("status.artifact", json!({"kind": "report", "title": if audit { "Ranked findings" } else { "Report" }, "content": report})).await?;
-                s.call("human.ask", json!({"question": if audit { "Which findings should I fix? (e.g. '2', 'all', or 'none')" } else { "Report attached. Shall I make the change? (yes/no)" }})).await?;
+                if audit {
+                    s.call("human.ask", json!({"question": "Which findings should I fix? (e.g. '2', 'all', or 'none')"})).await?;
+                } else {
+                    s.call("plan.submit", json!({"plan": format!("{report}\nI propose to add CONTRIBUTING.md and open a PR."), "summary": "Add a CONTRIBUTING note"})).await?;
+                    self.state.phase = "planned".into();
+                }
             }
-            InputKind::Answer => {
+            // Ad hoc plan phase: requested changes or a reminder: resubmit.
+            InputKind::Answer | InputKind::Other if !audit && self.state.phase == "planned" => {
+                s.call("plan.submit", json!({"plan": format!("Revised proposal: {}\nI propose to add CONTRIBUTING.md and open a PR.", s.input.text.lines().next().unwrap_or("")), "summary": "Revised proposal"})).await?;
+            }
+            InputKind::Answer | InputKind::Approval => {
                 let a = s.input.text.to_lowercase();
                 let fix = !(a.contains("none") || a.starts_with("no"));
                 if fix && s.ctx.ws.spec.branch.is_some() {
@@ -306,6 +351,11 @@ impl Harness for Scripted {
             let mut rx = ctx.interrupt.clone();
             let _ = rx.wait_for(|v| *v).await;
             return Ok(TurnOutcome::Interrupted);
+        }
+        if fault("fail_start") && input.kind == InputKind::Start {
+            // A model refusing the request: the turn fails without doing anything.
+            let _ = ctx.events.send(HarnessEvent::Error { message: "400 fault: the model refused the request".into() });
+            return Ok(TurnOutcome::Failed);
         }
         let workflow = ctx.ws.spec.workflow;
         let mut s = Step { ctx: &ctx, input: &input, n: 0 };

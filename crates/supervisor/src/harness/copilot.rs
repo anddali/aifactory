@@ -135,6 +135,9 @@ impl Copilot {
             .env("COPILOT_PROVIDER_API_KEY", &ws.spec.model.api_key)
             .env("COPILOT_PROVIDER_TYPE", "openai")
             .env("COPILOT_MODEL", &ws.spec.model.model)
+            // `responses` is needed by newer OpenAI models, which refuse tools together with
+            // reasoning effort on /chat/completions. Copilot's default is `completions`.
+            .env("COPILOT_PROVIDER_WIRE_API", ws.spec.model.wire_api.as_deref().unwrap_or("completions"))
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
             .env_remove("COPILOT_GITHUB_TOKEN")

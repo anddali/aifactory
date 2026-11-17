@@ -10,7 +10,7 @@ async fn runner_crash_mid_turn_and_replica_kill_cause_no_duplicates() {
     let mut env = Env::new(Opts { replicas: 2, fault: Some("crash_after_push"), ..Default::default() }).await;
     env.ticket("PROJ-2", "Crash test").await;
     let id = env.start_ticket_run("PROJ-2").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
 
     // Kill one replica; the other carries on (singleton duties fail over via
     // the advisory lock, the runner fails over via its URL list).
@@ -36,8 +36,8 @@ async fn runner_crash_mid_turn_and_replica_kill_cause_no_duplicates() {
     let count = env.git_upstream(&["rev-list", "--count", &format!("main..refs/heads/{branch}")]);
     assert_eq!(count, "1", "one commit, not two");
     // The interrupted turn was delivered again to the new runner generation.
-    let starts: Vec<_> = evs.iter().filter(|e| e["kind"] == "turn_started" && e["payload"]["kind"] == "answer").collect();
-    assert!(starts.len() >= 2, "the answer turn ran again after the crash");
+    let starts: Vec<_> = evs.iter().filter(|e| e["kind"] == "turn_started" && e["payload"]["kind"] == "approval").collect();
+    assert!(starts.len() >= 2, "the approval (build) turn ran again after the crash");
     assert_eq!(starts[0]["payload"]["instruction_id"], starts[1]["payload"]["instruction_id"]);
     assert_ne!(starts[0]["payload"]["generation"], starts[1]["payload"]["generation"]);
 
@@ -53,7 +53,7 @@ async fn duplicate_events_and_retried_jobs_are_idempotent() {
     let env = Env::new(Opts::default()).await;
     env.ticket("PROJ-3", "Dupes").await;
     let id = env.start_ticket_run("PROJ-3").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     // The same Slack event delivered three times (webhook retries) counts once.
     let ts = env.thread_of(id).await;
     for _ in 0..3 {
@@ -68,10 +68,70 @@ async fn duplicate_events_and_retried_jobs_are_idempotent() {
     // A second answer to the already-answered question is refused.
     let q = env.run(id).await["questions"][0]["id"].as_str().unwrap().to_string();
     let alice = env.login("alice@example.test").await;
-    let (s, _) = env.req(reqwest::Method::POST, &format!("/api/questions/{q}/answer"), Some(json!({"answer": "again"})), &alice).await;
+    let (s, _) = env.req(reqwest::Method::POST, &format!("/api/questions/{q}/answer"), Some(json!({"answer": "again", "decision": "approved"})), &alice).await;
     assert_eq!(s, 409, "first answer wins");
     assert_eq!(env.count_events(id, "question_answered").await, 1);
     // The chat message for the question was updated to show the answer.
     let msgs = env.chat_messages().await;
-    assert!(msgs.iter().any(|m| m["edited"] == true && m["text"].as_str().unwrap_or("").contains("answered by alice@example.test")));
+    assert!(msgs.iter().any(|m| m["edited"] == true && m["text"].as_str().unwrap_or("").contains("approved, building by alice@example.test")));
+}
+
+/// A runner that cannot set up its workspace (here: the upstream cannot be fetched) is not
+/// relaunched forever: after a few failures in a row the run pauses and people are told why;
+/// resuming after the cause is fixed carries on.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_workspace_setup_failures_pause_the_run() {
+    let env = Env::new(Opts::default()).await;
+    let up = env.upstream();
+    let hidden = up.with_extension("hidden");
+    std::fs::rename(&up, &hidden).unwrap();
+    env.ticket("PROJ-31", "Unreachable upstream").await;
+    let id = env.start_ticket_run("PROJ-31").await;
+    let r = env.wait_state(id, "paused", None, 180).await;
+    assert_eq!(r["state"], "paused");
+    let evs = env.events(id).await;
+    let failures = evs.iter().filter(|e| e["kind"] == "runner_exited" && e["payload"]["reason"] == "setup failed").count();
+    assert_eq!(failures, 3, "relaunched until the limit, then stopped");
+    let stuck = evs.iter().find(|e| e["kind"] == "stuck_detected").expect("stuck event");
+    assert_eq!(stuck["payload"]["kind"], "workspace_setup_failed");
+    assert!(stuck["payload"]["detail"].as_str().unwrap().contains("workspace setup failed"));
+    env.wait_chat("workspace setup failed 3 times in a row", 30).await;
+    // No further launches while paused.
+    let launches = env.count_events(id, "runner_launched").await;
+    for _ in 0..3 {
+        env.tick().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(env.count_events(id, "runner_launched").await, launches);
+
+    // Fix the cause and resume: the run proceeds normally.
+    std::fs::rename(&hidden, &up).unwrap();
+    let (status, _) = env.post_status(&format!("/api/runs/{id}/resume"), serde_json::json!({})).await;
+    assert_eq!(status, 200);
+    env.wait_state(id, "waiting", Some("approval"), 120).await;
+}
+
+/// A failed turn (here: the model refusing the request) is not left silently waiting: the run
+/// pauses, the error reaches the run's chat thread, and resuming retries the same turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_turn_pauses_tells_people_and_resume_retries() {
+    let env = Env::new(Opts { fault: Some("fail_start"), ..Default::default() }).await;
+    env.ticket("PROJ-32", "Model refuses").await;
+    let id = env.start_ticket_run("PROJ-32").await;
+    env.wait_state(id, "paused", None, 120).await;
+    let evs = env.events(id).await;
+    assert!(evs.iter().any(|e| e["kind"] == "turn_ended" && e["payload"]["outcome"] == "failed"));
+    let stuck = evs.iter().find(|e| e["kind"] == "stuck_detected").expect("stuck event");
+    assert_eq!(stuck["payload"]["kind"], "turn_failed");
+    assert!(stuck["payload"]["detail"].as_str().unwrap().contains("the model refused the request"));
+    env.wait_chat("The agent's turn failed and the run is paused. Error: 400 fault: the model refused the request", 30).await;
+
+    // Resume: the same start turn runs again (the fault only hits the first runner) and the
+    // run carries on to its first question.
+    let (status, _) = env.post_status(&format!("/api/runs/{id}/resume"), json!({})).await;
+    assert_eq!(status, 200);
+    env.wait_state(id, "waiting", Some("approval"), 120).await;
+    let evs = env.events(id).await;
+    let starts = evs.iter().filter(|e| e["kind"] == "turn_started" && e["payload"]["kind"] == "start").count();
+    assert_eq!(starts, 2, "the failed start turn was retried once");
 }

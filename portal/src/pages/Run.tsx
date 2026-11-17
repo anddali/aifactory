@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
-import { api, hasRole, TERMINAL_STATES, type Question, type RunDetail, type RunEvent, type RunSummary } from '../api';
+import { api, hasRole, TERMINAL_STATES, type Artifact, type Question, type RunDetail, type RunEvent, type RunSummary } from '../api';
 import { ActivityRow, ChatRow, ToolRow } from '../components/EventViews';
+import { FilterBar, FilterCheck, FilterSelect } from '../components/FilterBar';
 import { JsonBlock } from '../components/JsonView';
 import { QuestionCard } from '../components/QuestionCard';
 import { NeedsYou, StateBadge } from '../components/StateBadge';
@@ -9,7 +10,7 @@ import { Tabs } from '../components/Tabs';
 import { useToast } from '../components/Toast';
 import { VirtualList } from '../components/VirtualList';
 import { useAuth } from '../lib/auth';
-import { isConversation, isTool } from '../lib/events';
+import { CATEGORY_OPTIONS, conversationSide, distinct, eventCategory, isConversation, isFailure, isTool, matchesQuery, textMatches, toolName } from '../lib/events';
 import { absTime, num, optNum, relTime, usd, workflowLabel } from '../lib/format';
 import { useRunEvents } from '../lib/useRunEvents';
 import { CostCell } from './Dashboard';
@@ -20,6 +21,25 @@ type Tab = 'activity' | 'conversation' | 'tools' | 'artifacts' | 'cost' | 'quest
 const DETAIL_KINDS = new Set(['question_asked', 'question_answered', 'artifact', 'cost', 'harness.usage', 'state_changed', 'runner_launched', 'runner_exited', 'runner_lost']);
 
 const eventKey = (e: RunEvent) => e.seq;
+
+interface Filters {
+  activity: { q: string; cat: string; kind: string };
+  conversation: { q: string; side: string; actor: string };
+  tools: { q: string; name: string; type: string; failed: boolean };
+  artifacts: { q: string; kind: string };
+  questions: { q: string; state: string; kind: string };
+}
+
+const NO_FILTERS: Filters = {
+  activity: { q: '', cat: '', kind: '' },
+  conversation: { q: '', side: '', actor: '' },
+  tools: { q: '', name: '', type: '', failed: false },
+  artifacts: { q: '', kind: '' },
+  questions: { q: '', state: '', kind: '' },
+};
+
+/** Whether any field of one tab's filters is set. */
+const isActive = (f: object) => Object.values(f).some((v) => (typeof v === 'string' ? v.trim() !== '' : !!v));
 
 export function RunPage() {
   const { id = '' } = useParams();
@@ -67,6 +87,43 @@ export function RunPage() {
   const conversation = useMemo(() => ev.events.filter(isConversation), [ev.events]);
   const tools = useMemo(() => ev.events.filter(isTool), [ev.events]);
 
+  // Per-tab filters, kept while switching tabs and cleared when the run changes.
+  const [filters, setFilters] = useState<Filters>(NO_FILTERS);
+  useEffect(() => setFilters(NO_FILTERS), [id]);
+  const setF = <K extends keyof Filters>(k: K, patch: Partial<Filters[K]>) => setFilters((f) => ({ ...f, [k]: { ...f[k], ...patch } }));
+  const clearF = (k: keyof Filters) => setFilters((f) => ({ ...f, [k]: NO_FILTERS[k] }));
+  // Filtering runs on a deferred copy so typing in a search box stays responsive on long runs.
+  const df = useDeferredValue(filters);
+
+  const activityKinds = useMemo(
+    () => distinct(ev.events.filter((e) => !filters.activity.cat || eventCategory(e) === filters.activity.cat).map((e) => e.kind)),
+    [ev.events, filters.activity.cat],
+  );
+  const activity = useMemo(() => {
+    const f = df.activity;
+    if (!isActive(f)) return ev.events;
+    return ev.events.filter((e) => (!f.cat || eventCategory(e) === f.cat) && (!f.kind || e.kind === f.kind) && matchesQuery(e, f.q));
+  }, [ev.events, df.activity]);
+
+  const convActors = useMemo(() => distinct(conversation.map((e) => e.actor ?? '')), [conversation]);
+  const conversationShown = useMemo(() => {
+    const f = df.conversation;
+    if (!isActive(f)) return conversation;
+    return conversation.filter(
+      (e) =>
+        (!f.side || (f.side === 'questions' ? e.kind.startsWith('question') : conversationSide(e) === f.side)) &&
+        (!f.actor || e.actor === f.actor) &&
+        matchesQuery(e, f.q),
+    );
+  }, [conversation, df.conversation]);
+
+  const toolNames = useMemo(() => distinct(tools.map(toolName)), [tools]);
+  const toolsShown = useMemo(() => {
+    const f = df.tools;
+    if (!isActive(f)) return tools;
+    return tools.filter((e) => (!f.name || toolName(e) === f.name) && (!f.type || e.kind === f.type) && (!f.failed || isFailure(e)) && matchesQuery(e, f.q));
+  }, [tools, df.tools]);
+
   if (!run) {
     return <div className="page">{loadError ? <div className="banner banner-error">{loadError}</div> : <div className="muted">Loading run…</div>}</div>;
   }
@@ -80,6 +137,98 @@ export function RunPage() {
   const renderChat = (e: RunEvent) => <ChatRow e={e} />;
   const renderTool = (e: RunEvent) => <ToolRow e={e} />;
   const listProps = { hasMore: ev.hasMore, loadingOlder: ev.loadingOlder, onLoadOlder: ev.loadOlder, getKey: eventKey };
+  const noMatch = `No loaded events match these filters${ev.hasMore ? ' (older events are not loaded yet)' : ''}.`;
+
+  const fa = filters.activity;
+  const fc = filters.conversation;
+  const ft = filters.tools;
+  const fr = filters.artifacts;
+  const fq = filters.questions;
+  const artifactsShown = run.artifacts.filter((a) => (!df.artifacts.kind || a.kind === df.artifacts.kind) && textMatches(df.artifacts.q, a.kind, a.title, a.url, a.content));
+  const questionsShown = run.questions.filter(
+    (q) =>
+      (!df.questions.state || q.state === df.questions.state) &&
+      (!df.questions.kind || q.kind === df.questions.kind) &&
+      textMatches(df.questions.q, q.text, q.answer, q.decision, q.answered_by, q.action),
+  );
+
+  let filterBar: ReactNode = null;
+  if (tab === 'activity') {
+    filterBar = (
+      <FilterBar q={fa.q} onQ={(q) => setF('activity', { q })} placeholder="Search events…" shown={activity.length} total={ev.events.length} noun="loaded events" active={isActive(fa)} onClear={() => clearF('activity')}>
+        <FilterSelect value={fa.cat} onChange={(cat) => setF('activity', { cat, kind: '' })} label="Category" all="All categories" options={CATEGORY_OPTIONS} />
+        <FilterSelect value={fa.kind} onChange={(kind) => setF('activity', { kind })} label="Event kind" all="All kinds" options={activityKinds.map((k) => [k, k])} />
+      </FilterBar>
+    );
+  } else if (tab === 'conversation') {
+    filterBar = (
+      <FilterBar q={fc.q} onQ={(q) => setF('conversation', { q })} placeholder="Search messages…" shown={conversationShown.length} total={conversation.length} noun="messages" active={isActive(fc)} onClear={() => clearF('conversation')}>
+        <FilterSelect
+          value={fc.side}
+          onChange={(side) => setF('conversation', { side })}
+          label="From"
+          all="Everyone"
+          options={[
+            ['human', 'Humans'],
+            ['agent', 'Agent'],
+            ['questions', 'Questions & approvals'],
+          ]}
+        />
+        <FilterSelect value={fc.actor} onChange={(actor) => setF('conversation', { actor })} label="Sender" all="Any sender" options={convActors.map((a) => [a, a])} />
+      </FilterBar>
+    );
+  } else if (tab === 'tools') {
+    filterBar = (
+      <FilterBar q={ft.q} onQ={(q) => setF('tools', { q })} placeholder="Search tool calls…" shown={toolsShown.length} total={tools.length} noun="tool events" active={isActive(ft)} onClear={() => clearF('tools')}>
+        <FilterSelect value={ft.name} onChange={(name) => setF('tools', { name })} label="Tool" all="All tools" options={toolNames.map((n) => [n, n])} />
+        <FilterSelect
+          value={ft.type}
+          onChange={(type) => setF('tools', { type })}
+          label="Type"
+          all="Calls, results, primitives"
+          options={[
+            ['harness.tool_call', 'Calls'],
+            ['harness.tool_result', 'Results'],
+            ['primitive_call', 'Primitives'],
+          ]}
+        />
+        <FilterCheck checked={ft.failed} onChange={(failed) => setF('tools', { failed })}>
+          Failures only
+        </FilterCheck>
+      </FilterBar>
+    );
+  } else if (tab === 'artifacts' && run.artifacts.length) {
+    filterBar = (
+      <FilterBar q={fr.q} onQ={(q) => setF('artifacts', { q })} placeholder="Search artifacts…" shown={artifactsShown.length} total={run.artifacts.length} noun="artifacts" active={isActive(fr)} onClear={() => clearF('artifacts')}>
+        <FilterSelect value={fr.kind} onChange={(kind) => setF('artifacts', { kind })} label="Artifact kind" all="All kinds" options={distinct(run.artifacts.map((a) => a.kind)).map((k) => [k, k])} />
+      </FilterBar>
+    );
+  } else if (tab === 'questions' && run.questions.length) {
+    filterBar = (
+      <FilterBar q={fq.q} onQ={(q) => setF('questions', { q })} placeholder="Search questions…" shown={questionsShown.length} total={run.questions.length} noun="questions" active={isActive(fq)} onClear={() => clearF('questions')}>
+        <FilterSelect
+          value={fq.state}
+          onChange={(state) => setF('questions', { state })}
+          label="State"
+          all="Open and answered"
+          options={[
+            ['open', 'Open'],
+            ['answered', 'Answered'],
+          ]}
+        />
+        <FilterSelect
+          value={fq.kind}
+          onChange={(kind) => setF('questions', { kind })}
+          label="Kind"
+          all="Questions and approvals"
+          options={[
+            ['question', 'Questions'],
+            ['approval', 'Approvals'],
+          ]}
+        />
+      </FilterBar>
+    );
+  }
 
   return (
     <div className="page run-page">
@@ -105,22 +254,31 @@ export function RunPage() {
         active={tab}
         onChange={setTab}
       />
+      {filterBar}
       <div className="run-pane">
         {tab === 'activity' ? (
-          <VirtualList key="activity" items={ev.events} render={renderActivity} estimateSize={30} empty={ev.initialLoaded ? 'No events yet.' : 'Loading events…'} {...listProps} />
+          <VirtualList
+            key="activity"
+            items={activity}
+            render={renderActivity}
+            estimateSize={30}
+            empty={!ev.initialLoaded ? 'Loading events…' : isActive(fa) ? noMatch : 'No events yet.'}
+            {...listProps}
+          />
         ) : null}
         {tab === 'conversation' ? (
-          <VirtualList key="conversation" items={conversation} render={renderChat} estimateSize={72} empty="No conversation in the loaded events." {...listProps} />
+          <VirtualList key="conversation" items={conversationShown} render={renderChat} estimateSize={72} empty={isActive(fc) ? noMatch : 'No conversation in the loaded events.'} {...listProps} />
         ) : null}
         {tab === 'tools' ? (
-          <VirtualList key="tools" items={tools} render={renderTool} estimateSize={30} empty="No tool calls in the loaded events." {...listProps} />
+          <VirtualList key="tools" items={toolsShown} render={renderTool} estimateSize={30} empty={isActive(ft) ? noMatch : 'No tool calls in the loaded events.'} {...listProps} />
         ) : null}
-        {tab === 'artifacts' ? <ArtifactsPane run={run} /> : null}
+        {tab === 'artifacts' ? <ArtifactsPane run={run} artifacts={artifactsShown} /> : null}
         {tab === 'cost' ? <CostPane run={run} /> : null}
         {tab === 'questions' ? (
           <div className="scroll-pane">
             {run.questions.length === 0 ? <div className="muted">No questions or approvals.</div> : null}
-            {run.questions.map((q) => (
+            {run.questions.length > 0 && questionsShown.length === 0 ? <div className="muted">No questions match these filters.</div> : null}
+            {questionsShown.map((q) => (
               <QuestionCard key={q.id} q={q} canAnswer={q.kind === 'approval' ? canApprove : canOperate} onAnswered={onAnswered} />
             ))}
           </div>
@@ -148,6 +306,7 @@ function RunHeader({ run, live }: { run: RunDetail; live: boolean }) {
       <dl className="facts">
         <Fact k="Project">{run.project_key}</Fact>
         <Fact k="Workflow">{workflowLabel(run.workflow)}</Fact>
+        {run.phase ? <Fact k="Phase">{run.phase === 'plan' ? 'plan (awaiting approval to build)' : 'build'}</Fact> : null}
         <Fact k="Cost">
           <CostCell spent={run.spent_usd} budget={run.budget_usd} />
         </Fact>
@@ -317,11 +476,13 @@ function CapDecision({ run, onDone }: { run: RunDetail; onDone: () => void }) {
   );
 }
 
-function ArtifactsPane({ run }: { run: RunDetail }) {
+function ArtifactsPane({ run, artifacts }: { run: RunDetail; artifacts: Artifact[] }) {
   if (!run.artifacts.length) return <div className="scroll-pane muted">No artifacts yet.</div>;
+  if (!artifacts.length) return <div className="scroll-pane muted">No artifacts match these filters.</div>;
+  const latestPlan = [...run.artifacts].reverse().find((a) => a.kind === 'plan')?.id;
   return (
     <div className="scroll-pane">
-      {run.artifacts.map((a) => (
+      {artifacts.map((a) => (
         <div key={a.id} className="artifact">
           <div className="artifact-head">
             <span className="tag">{a.kind}</span>
@@ -337,9 +498,9 @@ function ArtifactsPane({ run }: { run: RunDetail }) {
             </span>
           </div>
           {a.content ? (
-            <details>
+            <details open={a.id === latestPlan}>
               <summary>Content</summary>
-              <JsonBlock value={a.content} />
+              {a.kind === 'plan' || a.kind === 'report' ? <pre className="artifact-text">{a.content}</pre> : <JsonBlock value={a.content} />}
             </details>
           ) : null}
         </div>

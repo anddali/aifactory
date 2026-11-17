@@ -47,5 +47,8 @@ url = "2"
 async-stream = "0.3"
 aws-config = { version = "1.13", features = ["behavior-version-latest"] }
 aws-sdk-ecs = "1.159"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
 
 [dev-dependencies]

@@ -97,6 +97,9 @@ pub const CATALOGUE: &[PrimitiveDef] = &[
     p!("human.request_approval", true, "Request an approval. Ends the turn; the decision starts the next turn.", [
         ("action","string",true,"What will happen on approval, e.g. merge"), ("summary","string",true,"Why"),
         ("pr","integer",false,"PR number the approval names")]),
+    // Plan (two-phase workflows)
+    p!("plan.submit", true, "Submit your plan for review (plan phase only). Ends the turn; the reviewer's decision starts the next turn: approval starts the build phase, requested changes come back to revise.", [
+        ("plan","string",true,"The plan, in Markdown"), ("summary","string",false,"One line summarising the plan")]),
     // Status
     p!("status.report", true, "Report progress.", [("text","string",true,"Progress note")]),
     p!("status.artifact", true, "Attach an artifact (PR link, report).", [("kind","string",true,"pr|report|link"), ("title","string",true,"Title"),

@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/runs", get(list_runs).post(create_run))
+        .route("/api/runs/facets", get(run_facets))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/events", get(run_events))
         .route("/api/runs/{id}/stream", get(stream))
@@ -34,6 +35,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/connectors/{id}", put(update_connector).delete(delete_connector))
         .route("/api/connectors/{id}/secrets", put(put_secrets))
         .route("/api/connectors/{id}/test", post(test_connector))
+        .route("/api/connectors/test", post(test_connector_draft))
         .route("/api/connectors/{id}/repos", get(connector_repos))
         .route("/api/connector-kinds", get(connector_kinds))
         .route("/api/projects", get(list_projects).post(create_project))
@@ -47,6 +49,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/users/{id}/grants", put(put_grants))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/rotate-key", post(rotate_secrets))
+        .route("/api/settings/egress-test", post(egress_test))
         .route("/api/audit", get(audit))
         .route("/api/metrics/outcomes", get(outcomes))
         .route("/api/_tick", post(force_tick))
@@ -81,7 +84,7 @@ async fn run_summary(state: &AppState, run: &Run, viewer: Option<&User>) -> ApiR
         "spent_usd": run.spent_usd, "budget_usd": run.budget_usd, "turns_used": run.turns_used, "max_turns": run.max_turns,
         "needs_you": needs_you, "ticket_key": run.ticket_key, "repo": repo, "pr_number": run.pr_number, "pr_url": run.pr_url,
         "branch": run.branch, "assignee": assignee.map(|(id, e, n)| json!({"id": id, "email": e, "display_name": n})),
-        "model": run.model, "harness": run.harness, "created_at": run.created_at, "updated_at": run.updated_at,
+        "model": run.model, "harness": run.harness, "phase": run.phase, "created_at": run.created_at, "updated_at": run.updated_at,
         "last_activity_at": run.last_activity_at, "outcome": run.outcome, "review_rounds": run.review_rounds,
         "tokens_in": run.tokens_in, "tokens_out": run.tokens_out, "expired_at": run.expired_at, "finished_at": run.finished_at,
     }))
@@ -89,9 +92,31 @@ async fn run_summary(state: &AppState, run: &Run, viewer: Option<&User>) -> ApiR
 
 #[derive(Deserialize)]
 struct ListQ {
+    /// `active` | `done` | `all`
     state: Option<String>,
     project_id: Option<Uuid>,
     limit: Option<i64>,
+    /// Exact run states, comma-separated (`waiting,paused`).
+    status: Option<String>,
+    workflow: Option<String>,
+    harness: Option<String>,
+    model: Option<String>,
+    /// Repository full name.
+    repo: Option<String>,
+    /// A user id, or `me`.
+    assignee: Option<String>,
+    /// Free text: title, ticket key, branch, run id prefix or PR number.
+    q: Option<String>,
+}
+
+fn nonempty(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// `%text%` for ILIKE, with the pattern characters escaped.
+fn like_pattern(text: &str) -> String {
+    let esc = text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{esc}%")
 }
 
 async fn visible_projects(state: &AppState, user: &User) -> ApiResult<Option<Vec<Uuid>>> {
@@ -111,14 +136,80 @@ async fn list_runs(State(state): State<AppState>, user: User, Query(q): Query<Li
         Some("done") => "state IN ('finished','failed','cancelled','expired')",
         _ => "true",
     };
-    let sql = format!("SELECT * FROM runs WHERE {filter} AND ($1::uuid IS NULL OR project_id=$1) ORDER BY created_at DESC LIMIT $2");
-    let rows: Vec<Run> = sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(q.project_id).bind(q.limit.unwrap_or(100).clamp(1, 1000)).fetch_all(&state.pool).await?;
+    let statuses: Option<Vec<String>> = nonempty(&q.status).map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
+    let assignee: Option<Uuid> = match nonempty(&q.assignee).as_deref() {
+        None => None,
+        Some("me") => Some(user.id),
+        Some(id) => Some(id.parse().map_err(|_| bad("assignee must be a user id or 'me'"))?),
+    };
+    let text = nonempty(&q.q);
+    let pattern = text.as_deref().map(like_pattern);
+    let pr_number: Option<i64> = text.as_deref().and_then(|t| t.trim_start_matches('#').parse().ok());
+    // Visibility is part of the query, so other projects' runs never use up the limit.
     let visible = visible_projects(&state, &user).await?;
+    let sql = format!(
+        "SELECT * FROM runs WHERE {filter}
+           AND ($1::uuid IS NULL OR project_id=$1)
+           AND ($3::uuid[] IS NULL OR project_id = ANY($3))
+           AND ($4::text[] IS NULL OR state = ANY($4))
+           AND ($5::text IS NULL OR workflow=$5)
+           AND ($6::text IS NULL OR harness=$6)
+           AND ($7::text IS NULL OR model=$7)
+           AND ($8::text IS NULL OR repo_id IN (SELECT id FROM repositories WHERE full_name=$8))
+           AND ($9::uuid IS NULL OR assignee_user_id=$9)
+           AND ($10::text IS NULL OR title ILIKE $10 OR ticket_key ILIKE $10 OR branch ILIKE $10 OR id::text ILIKE $10 OR pr_number=$11)
+         ORDER BY created_at DESC LIMIT $2"
+    );
+    let rows: Vec<Run> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(q.project_id)
+        .bind(q.limit.unwrap_or(100).clamp(1, 1000))
+        .bind(visible)
+        .bind(statuses)
+        .bind(nonempty(&q.workflow))
+        .bind(nonempty(&q.harness))
+        .bind(nonempty(&q.model))
+        .bind(nonempty(&q.repo))
+        .bind(assignee)
+        .bind(pattern)
+        .bind(pr_number)
+        .fetch_all(&state.pool)
+        .await?;
     let mut out = vec![];
-    for r in rows.iter().filter(|r| visible.as_ref().map(|v| v.contains(&r.project_id)).unwrap_or(true)) {
+    for r in &rows {
         out.push(run_summary(&state, r, Some(&user)).await?);
     }
     Ok(Json(json!({"runs": out})))
+}
+
+/// Values present in the runs this user can see, for the Runs page filters.
+async fn run_facets(State(state): State<AppState>, user: User) -> ApiResult<Json<Value>> {
+    let visible = visible_projects(&state, &user).await?;
+    let distinct = |col: &'static str| {
+        let pool = state.pool.clone();
+        let visible = visible.clone();
+        async move {
+            let sql = format!("SELECT DISTINCT {col} FROM runs WHERE ($1::uuid[] IS NULL OR project_id = ANY($1)) AND {col} IS NOT NULL AND {col} <> '' ORDER BY 1");
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(visible).fetch_all(&pool).await
+        }
+    };
+    let models = distinct("model").await?;
+    let harnesses = distinct("harness").await?;
+    let repos: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT r.full_name FROM runs x JOIN repositories r ON r.id=x.repo_id WHERE ($1::uuid[] IS NULL OR x.project_id = ANY($1)) ORDER BY 1",
+    )
+    .bind(&visible)
+    .fetch_all(&state.pool)
+    .await?;
+    let assignees: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT DISTINCT u.id, u.email, u.display_name FROM runs x JOIN users u ON u.id=x.assignee_user_id WHERE ($1::uuid[] IS NULL OR x.project_id = ANY($1)) ORDER BY u.email",
+    )
+    .bind(&visible)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(json!({
+        "models": models, "harnesses": harnesses, "repos": repos,
+        "assignees": assignees.into_iter().map(|(id, email, name)| json!({"id": id, "email": email, "display_name": name})).collect::<Vec<_>>(),
+    })))
 }
 
 async fn create_run(State(state): State<AppState>, user: User, Json(req): Json<NewRun>) -> ApiResult<Json<Value>> {
@@ -231,8 +322,7 @@ struct SteerReq {
 
 async fn steer(State(state): State<AppState>, user: User, Path(id): Path<Uuid>, Json(req): Json<SteerReq>) -> ApiResult<Json<Value>> {
     let run = load_run(&state, &user, id, "operate").await?;
-    events::append(&state.pool, &*state.blobs, run.id, "human_message", Some(&user.email), json!({"text": req.text, "direction": "from_human", "via": "portal"})).await?;
-    engine::steer(&state, &run, &req.text, req.interrupt, &user.email, Some(user.id)).await?;
+    engine::steer(&state, &run, &req.text, req.interrupt, &user.email, Some(user.id), "portal").await?;
     Ok(Json(json!({})))
 }
 
@@ -444,8 +534,36 @@ async fn connector_repos(State(state): State<AppState>, user: User, Path(id): Pa
     Ok(Json(json!({"repos": host.list_repos().await?})))
 }
 
-async fn connector_kinds(State(_state): State<AppState>, _user: User) -> Json<Value> {
-    Json(json!({"kinds": crate::connectors::KINDS.iter().map(|k| json!({"kind": k.kind, "role": k.role, "config_fields": k.config_fields, "secret_fields": k.secret_fields})).collect::<Vec<_>>()}))
+#[derive(Deserialize)]
+struct DraftTestReq {
+    id: Option<Uuid>,
+    kind: String,
+    #[serde(default)]
+    config: Value,
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
+}
+
+/// Test a connector's settings as entered in the form, before (or without) saving them.
+async fn test_connector_draft(State(state): State<AppState>, user: User, Json(req): Json<DraftTestReq>) -> ApiResult<Json<Value>> {
+    user.require_admin(&state).await?;
+    let config = if req.config.is_object() { req.config } else { json!({}) };
+    let r = crate::connectors::test_draft(&state, req.id, &req.kind, config, req.secrets).await;
+    crate::audit::record(&state.pool, &user.email, Some(user.id), "config.connector.test", None, None, json!({"connector": req.id, "kind": req.kind, "draft": true, "ok": r.is_ok()})).await;
+    Ok(Json(match r {
+        Ok(m) => json!({"ok": true, "message": m}),
+        Err(e) => json!({"ok": false, "message": format!("{e:#}")}),
+    }))
+}
+
+async fn connector_kinds(State(state): State<AppState>, _user: User) -> Json<Value> {
+    let base = state.cfg.public_urls.first().map(|u| u.trim_end_matches('/').to_string()).unwrap_or_default();
+    Json(json!({"kinds": crate::connectors::KINDS.iter().map(|k| json!({
+        "kind": k.kind, "label": k.label, "role": k.role, "description": k.description,
+        "config_fields": k.config_fields, "secret_fields": k.secret_fields,
+        "webhook_url": k.webhook.map(|w| format!("{base}/webhooks/{w}/{{id}}")),
+        "webhook_show_if": k.webhook_show_if,
+    })).collect::<Vec<_>>()}))
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +864,56 @@ async fn put_settings(State(state): State<AppState>, user: User, Json(patch): Js
         engine::apply_kill_switch(&state, &user.email, Some(user.id)).await?;
     }
     Ok(Json(serde_json::to_value(s).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct EgressTestReq {
+    /// Proxy URL to test; defaults to the saved one.
+    url: Option<String>,
+}
+
+/// Check an egress proxy from the plane: an allowlisted host must get through (any HTTP
+/// response counts) and a host not on the allowlist must be refused. Nothing is saved.
+async fn egress_test(State(state): State<AppState>, user: User, Json(req): Json<EgressTestReq>) -> ApiResult<Json<Value>> {
+    user.require_admin(&state).await?;
+    let s = crate::settings::get(&state.pool).await?;
+    let url = req.url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).or(s.egress_proxy_url.clone()).ok_or_else(|| bad("no egress proxy URL to test"))?;
+    let parsed = url::Url::parse(&url).map_err(|e| bad(format!("invalid proxy URL: {e}")))?;
+    if parsed.scheme() != "http" || parsed.host_str().is_none() {
+        return Err(bad("the proxy URL must look like http://host:port"));
+    }
+    let proxy = reqwest::Proxy::all(&url).map_err(|e| bad(format!("invalid proxy URL: {e}")))?;
+    let client = reqwest::Client::builder().proxy(proxy).timeout(std::time::Duration::from_secs(10)).build().map_err(|e| bad(format!("{e}")))?;
+    let allowed_host = s.egress_allowlist.iter().map(|h| h.trim().trim_start_matches('.')).find(|h| !h.is_empty() && !h.contains('*')).map(String::from);
+    let blocked_host = ["example.com", "example.org", "example.net"].into_iter().find(|h| !crate::egress::allowed(&s.egress_allowlist, h)).unwrap_or("example.com");
+    let probe = |host: String| {
+        let client = client.clone();
+        async move {
+            match client.head(format!("https://{host}/")).send().await {
+                Ok(r) => (true, format!("HTTP {}", r.status().as_u16())),
+                Err(e) => (false, format!("{:#}", anyhow::Error::new(e))),
+            }
+        }
+    };
+    let allowed = match allowed_host {
+        Some(h) => {
+            let (reached, detail) = probe(h.clone()).await;
+            json!({"host": h, "ok": reached, "detail": if reached { format!("reachable through the proxy ({detail})") } else { detail }})
+        }
+        None => json!({"host": null, "ok": false, "detail": "the allowlist is empty, so nothing can get through"}),
+    };
+    // Only a refusal by the proxy itself (CONNECT answered with an error status) proves the
+    // allowlist works; an unreachable proxy fails every request and proves nothing.
+    let (reached, detail) = probe(blocked_host.to_string()).await;
+    let blocked = if reached {
+        json!({"host": blocked_host, "ok": false, "detail": format!("NOT blocked: {detail}")})
+    } else if detail.contains("tunnel error: unsuccessful") {
+        json!({"host": blocked_host, "ok": true, "detail": "refused by the proxy"})
+    } else {
+        json!({"host": blocked_host, "ok": false, "detail": format!("could not check: {detail}")})
+    };
+    let ok = allowed["ok"] == true && blocked["ok"] == true;
+    Ok(Json(json!({"ok": ok, "proxy": url, "allowed": allowed, "blocked": blocked})))
 }
 
 #[derive(Deserialize)]

@@ -29,7 +29,7 @@ async fn ticket_build_with_docker_runner_containers() {
     let env = Env::new(Opts { docker: true, ..Default::default() }).await;
     env.ticket("PROJ-40", "Docker").await;
     let id = env.start_ticket_run("PROJ-40").await;
-    let r = env.wait_state(id, "waiting", Some("human_answer"), 240).await;
+    let r = env.wait_state(id, "waiting", Some("approval"), 240).await;
     assert!(r["runner"]["handle"].as_str().unwrap().starts_with("docker|"));
     assert_eq!(r["runner"]["image"], "rust", "stack detection picked the rust image");
     let simple = id.simple().to_string();

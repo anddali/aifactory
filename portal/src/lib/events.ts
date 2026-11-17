@@ -88,6 +88,81 @@ export function isTool(e: RunEvent): boolean {
   return TOOL_KINDS.has(e.kind);
 }
 
+// Event filtering for the Run view tabs.
+
+export type EventCategory = 'human' | 'agent' | 'tool' | 'state' | 'cost' | 'error' | 'other';
+
+export const CATEGORY_OPTIONS: [EventCategory, string][] = [
+  ['human', 'Human'],
+  ['agent', 'Agent'],
+  ['tool', 'Tools'],
+  ['state', 'State & runner'],
+  ['cost', 'Cost'],
+  ['error', 'Errors & failures'],
+  ['other', 'Other'],
+];
+
+/** An error event, a failed tool result or a failed primitive call. */
+export function isFailure(e: RunEvent): boolean {
+  const p = e.payload ?? {};
+  const k = e.kind;
+  return (
+    k.includes('error') ||
+    k === 'runner_lost' ||
+    k === 'stuck_detected' ||
+    (k === 'harness.tool_result' && (!!p.is_error || !!p.error || p.ok === false)) ||
+    (k === 'primitive_call' && p.ok === false)
+  );
+}
+
+export function eventCategory(e: RunEvent): EventCategory {
+  if (isFailure(e)) return 'error';
+  const k = e.kind;
+  if (k.startsWith('question') || k === 'human_message' || k === 'steering') return 'human';
+  if (TOOL_KINDS.has(k)) return 'tool';
+  if (k === 'state_changed' || k.startsWith('runner_')) return 'state';
+  if (k === 'cost' || k === 'harness.usage') return 'cost';
+  if (k.startsWith('harness.')) return 'agent';
+  return 'other';
+}
+
+/** Which side of the conversation an event is on. */
+export function conversationSide(e: RunEvent): 'human' | 'agent' {
+  if (e.kind === 'harness.agent_message' || e.kind === 'question_asked') return 'agent';
+  if (e.kind === 'human_message') return e.payload?.direction === 'to_human' ? 'agent' : 'human';
+  return 'human';
+}
+
+/** The tool or primitive name of a tool trace event, or ''. */
+export function toolName(e: RunEvent): string {
+  return typeof e.payload?.name === 'string' ? (e.payload.name as string) : '';
+}
+
+const searchText = new WeakMap<RunEvent, string>();
+
+/** Case-insensitive match of a search query against an event's kind, actor and payload. */
+export function matchesQuery(e: RunEvent, q: string): boolean {
+  const needle = q.trim().toLowerCase();
+  if (!needle) return true;
+  let hay = searchText.get(e);
+  if (hay === undefined) {
+    hay = `${e.kind} ${e.actor ?? ''} ${JSON.stringify(e.payload ?? {})}`.toLowerCase();
+    searchText.set(e, hay);
+  }
+  return hay.includes(needle);
+}
+
+/** Case-insensitive match of a query against plain strings. */
+export function textMatches(q: string, ...parts: (string | null | undefined)[]): boolean {
+  const needle = q.trim().toLowerCase();
+  return !needle || parts.some((s) => !!s && s.toLowerCase().includes(needle));
+}
+
+/** Sorted distinct non-empty values. */
+export function distinct(values: Iterable<string>): string[] {
+  return [...new Set(values)].filter(Boolean).sort();
+}
+
 /** One-line human summary of an event for the activity list. */
 export function summarize(e: RunEvent): string {
   const p = e.payload ?? {};

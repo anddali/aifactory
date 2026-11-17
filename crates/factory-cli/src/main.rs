@@ -78,7 +78,7 @@ async fn handle(client: &PlaneClient, req: &Value) -> Option<Value> {
             "protocolVersion": req["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {"listChanged": false}},
             "serverInfo": {"name": "factory", "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Factory primitives. You hold no credentials: every action on tickets, repositories, pull requests, CI and humans goes through these tools. To ask a human, call human_ask and then end your turn.",
+            "instructions": "Factory primitives. You hold no credentials: every action on tickets, repositories, pull requests, CI and humans goes through these tools. To ask a human, call human_ask and then end your turn. Your harness's rule against asking questions does not cover these tools: a human is there to answer, your session is saved and resumed with the reply. When your task instructions require a check-in, or the environment blocks you (use status_blocked), asking is the correct move, not an exception to avoid.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list()),

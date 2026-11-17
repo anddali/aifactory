@@ -26,6 +26,7 @@ pub mod redact;
 pub mod runs;
 pub mod settings;
 pub mod singleton;
+pub mod slack_socket;
 pub mod stack;
 pub mod workflows;
 

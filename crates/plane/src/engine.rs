@@ -116,7 +116,8 @@ pub async fn user_by_email(state: &AppState, email: &str) -> Result<Option<Uuid>
 
 /// Create a run. Enforces the kill switch, the per-project limits and the
 /// one-active-run-per-work-item constraint (in the database).
-pub async fn create_run(state: &AppState, req: NewRun, actor: &str, actor_user: Option<Uuid>) -> Result<Run, CreateError> {
+pub async fn create_run(state: &AppState, mut req: NewRun, actor: &str, actor_user: Option<Uuid>) -> Result<Run, CreateError> {
+    req.ticket_key = req.ticket_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let workflow = WorkflowKind::parse(&req.workflow).ok_or_else(|| CreateError::Refused(format!("unknown workflow {}", req.workflow)))?;
     let (pkey, pconf_v, _) = project(state, req.project_id).await?;
     let pconf = settings::project_config(&pconf_v);
@@ -151,6 +152,12 @@ pub async fn create_run(state: &AppState, req: NewRun, actor: &str, actor_user: 
         let key = req.ticket_key.clone().ok_or_else(|| CreateError::Refused("ticket_build needs ticket_key".into()))?;
         let tc = pconf.ticket_connector_id.ok_or_else(|| CreateError::Refused("project has no ticket source".into()))?;
         let t = crate::connectors::ticket_source(state, tc).await?.get(&key).await?;
+        // The ticket system's own key is canonical ("fub-114" is FUB-114; a moved issue has its
+        // new key). Everything below (run, title, de-duplication key, prompt) uses it, so the
+        // same ticket can never get two runs through different spellings.
+        if !t.key.is_empty() {
+            req.ticket_key = Some(t.key.clone());
+        }
         if repo_name.is_none() {
             repo_name = t.repo.clone();
         }
@@ -219,8 +226,8 @@ pub async fn create_run(state: &AppState, req: NewRun, actor: &str, actor_user: 
     let r = sqlx::query(
         "INSERT INTO runs(id, project_id, workflow, state, title, work_item_key, ticket_key, repo_id, pr_number, pr_url,
             base_branch, assignee_user_id, harness, model, budget_usd, max_turns, turn_timeout_secs, template_version,
-            policy_version, config_version, brief, scope, data, created_by, token_salt)
-         VALUES ($1,$2,$3,'queued',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)",
+            policy_version, config_version, brief, scope, data, created_by, token_salt, phase)
+         VALUES ($1,$2,$3,'queued',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
     )
     .bind(id)
     .bind(req.project_id)
@@ -246,6 +253,7 @@ pub async fn create_run(state: &AppState, req: NewRun, actor: &str, actor_user: 
     .bind(json!({"review_round_limit": review_round_limit, "ticket": ticket}))
     .bind(actor_user)
     .bind(&salt)
+    .bind(crate::workflows::two_phase(workflow).then_some("plan"))
     .execute(&state.pool)
     .await;
     if let Err(e) = r {
@@ -442,10 +450,47 @@ pub async fn runner_exited(state: &AppState, run: &Run, generation: i64, reason:
         remove_runner(&st, handle.as_deref()).await;
     });
     reset_acked(state, run.id, generation + 1).await?;
+    if reason == "setup failed" && stop_after_setup_failures(state, run, generation).await? {
+        return Ok(());
+    }
     if has_pending(state, run.id).await? {
         ensure_runner(state, run.id).await?;
     }
     Ok(())
+}
+
+/// Consecutive workspace setup failures before the run is paused instead of relaunched.
+pub const SETUP_FAILURE_LIMIT: i64 = 3;
+
+/// A runner that starts but cannot set up its workspace (clone refused, bad credentials) fails
+/// the same way on every relaunch. After [`SETUP_FAILURE_LIMIT`] in a row (since the last turn
+/// started or the run was resumed) pause the run and tell people the error; resuming retries.
+async fn stop_after_setup_failures(state: &AppState, run: &Run, generation: i64) -> Result<bool> {
+    let (failures, last_error): (i64, Option<String>) = sqlx::query_as(
+        "WITH since AS (
+            SELECT COALESCE(max(seq), 0) AS s FROM events
+             WHERE run_id=$1 AND (kind='turn_started' OR (kind='state_changed' AND payload->>'reason'='resumed'))
+         )
+         SELECT
+           (SELECT count(*) FROM events, since WHERE run_id=$1 AND seq > since.s AND kind='runner_exited' AND payload->>'reason'='setup failed'),
+           (SELECT payload->>'message' FROM events, since WHERE run_id=$1 AND seq > since.s AND kind='harness.error' ORDER BY seq DESC LIMIT 1)",
+    )
+    .bind(run.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if failures < SETUP_FAILURE_LIMIT {
+        return Ok(false);
+    }
+    let detail = last_error.unwrap_or_else(|| "no error reported".into());
+    let detail: String = detail.chars().take(500).collect();
+    events::append(&state.pool, &*state.blobs, run.id, "stuck_detected", None, json!({"kind": "workspace_setup_failed", "detail": detail, "failures": failures, "paused": true})).await?;
+    let run = runs::get(state, run.id).await?;
+    pause(state, &run, "workspace_setup_failed", "stuck-detector", None).await?;
+    let key = format!("setup_failed:{}:{generation}", run.id);
+    let text = format!("Run {} paused: workspace setup failed {failures} times in a row. Last error: {detail}. Fix the cause, then resume the run.", run.title);
+    humans::notify(state, &run, &format!("{key}:assignee"), &text).await?;
+    humans::notify_ops(state, &run, &format!("{key}:ops"), &format!("[ops] run {} ({}) workspace_setup_failed: {detail}", run.id, run.title)).await?;
+    Ok(true)
 }
 
 /// The runner stopped heart-beating: treat it as lost and recover from the
@@ -652,6 +697,29 @@ pub async fn evaluate(state: &AppState, run: &Run) -> Result<()> {
         runs::transition(state, run.id, RunState::Waiting, Some("human_answer"), &format!("blocked: {reason}"), None).await?;
         return Ok(());
     }
+    if run.in_plan_phase() {
+        // A plan-phase turn ended without a plan under review: remind, and if the turn that
+        // got the reminder also ends without one, pause.
+        let last_was_reminder: bool = sqlx::query_scalar("SELECT COALESCE((SELECT data->>'reminder' = 'plan' FROM inputs WHERE run_id=$1 ORDER BY created_at DESC LIMIT 1), false)")
+            .bind(run.id)
+            .fetch_one(&state.pool)
+            .await?;
+        if !last_was_reminder {
+            events::append(&state.pool, &*state.blobs, run.id, "plan_missing", None, json!({"action": "reminded"})).await?;
+            remind_plan(state, run).await?;
+        } else {
+            events::append(&state.pool, &*state.blobs, run.id, "plan_missing", None, json!({"action": "paused"})).await?;
+            pause(state, run, "no_plan", "plan-check", None).await?;
+            humans::notify(
+                state,
+                run,
+                &format!("no-plan:{}:{}", run.id, run.turns_used),
+                "The agent ended its turn twice without submitting a plan. The run is paused; steer it or resume it to try again.",
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     match workflow {
         WorkflowKind::AdHoc | WorkflowKind::SecurityAudit if run.finish_declared => {
             finish(state, run.id, "completed", "the agent declared the work finished").await?;
@@ -673,12 +741,83 @@ pub async fn evaluate(state: &AppState, run: &Run) -> Result<()> {
 // Controls
 // ---------------------------------------------------------------------------
 
-pub async fn steer(state: &AppState, run: &Run, text: &str, interrupt: bool, actor: &str, user: Option<Uuid>) -> Result<()> {
+/// The agent called a tool that ends its turn (a question, an approval request, a plan, a
+/// blocker). Models do not always stop by themselves, so stop the turn for them; the reply
+/// starts the next turn in the same session.
+pub async fn end_turn_now(state: &AppState, run_id: Uuid, why: &str) -> Result<()> {
+    let run = runs::get(state, run_id).await?;
+    if !run.runner_busy || run.state().is_terminal() {
+        return Ok(());
+    }
+    add_instruction(state, run.id, &Instruction::Interrupt, None, false).await?;
+    events::append(&state.pool, &*state.blobs, run.id, "turn_end_enforced", None, json!({"after": why})).await?;
+    Ok(())
+}
+
+/// After spending was recorded: stop a turn that has used up the run budget (instead of
+/// letting the harness wait on refused model calls until the turn times out), and pause a run
+/// whose plan phase has used up its share of the budget.
+pub async fn after_spend(state: &AppState, run_id: Uuid) -> Result<()> {
+    let run = runs::get(state, run_id).await?;
+    if run.state().is_terminal() || run.state() == RunState::Paused {
+        return Ok(());
+    }
+    if run.spent_usd >= run.budget_usd {
+        let key = format!("budget_stop:{}:{}", run.id, run.turns_used);
+        if first_time(state, &key).await? {
+            end_turn_now(state, run.id, "budget spent").await?;
+        }
+        return Ok(());
+    }
+    if run.in_plan_phase() {
+        let share = project_cfg(state, run.project_id).await?.plan_budget_share;
+        let cap = run.budget_usd * share;
+        if share > 0.0 && run.spent_usd >= cap && first_time(state, &format!("plan_budget:{}", run.id)).await? {
+            events::append(&state.pool, &*state.blobs, run.id, "plan_budget_reached", None, json!({"spent_usd": run.spent_usd, "cap_usd": cap, "share": share})).await?;
+            pause(state, &run, "plan_budget", "budget", None).await?;
+            humans::notify(
+                state,
+                &run,
+                &format!("plan-budget:{}", run.id),
+                &format!(
+                    "The plan phase has used ${:.2} of the ${:.2} it may spend ({:.0}% of the run budget) without submitting a plan. The run is paused; resume it to let the agent continue, or steer it towards submitting its plan.",
+                    run.spent_usd,
+                    cap,
+                    share * 100.0
+                ),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remind_plan(state: &AppState, run: &Run) -> Result<()> {
+    deliver_input(
+        state,
+        run,
+        InputKind::Other,
+        "Your turn ended without a plan. This run is in its plan phase: submit your plan with plan.submit now (or call status.blocked if something prevents you from planning).",
+        json!({"reminder": "plan"}),
+        &format!("plan-reminder:{}", Uuid::now_v7()),
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn first_time(state: &AppState, key: &str) -> Result<bool> {
+    Ok(sqlx::query("INSERT INTO side_effects(key, status) VALUES ($1,'done') ON CONFLICT DO NOTHING").bind(key).execute(&state.pool).await?.rows_affected() > 0)
+}
+
+/// Delivers a steering message. The `steering` event is the only conversation record of it, so
+/// callers must not also append a `human_message` (the portal would show the message twice).
+pub async fn steer(state: &AppState, run: &Run, text: &str, interrupt: bool, actor: &str, user: Option<Uuid>, via: &str) -> Result<()> {
     if run.state().is_terminal() {
         bail!("run is {}", run.state);
     }
-    events::append(&state.pool, &*state.blobs, run.id, "steering", Some(actor), json!({"text": text, "interrupt": interrupt})).await?;
-    crate::audit::record(&state.pool, actor, user, "run.steer", Some(run.project_id), Some(run.id), json!({"text": text, "interrupt": interrupt})).await;
+    events::append(&state.pool, &*state.blobs, run.id, "steering", Some(actor), json!({"text": text, "interrupt": interrupt, "via": via})).await?;
+    crate::audit::record(&state.pool, actor, user, "run.steer", Some(run.project_id), Some(run.id), json!({"text": text, "interrupt": interrupt, "via": via})).await;
     if interrupt && run.runner_busy {
         add_instruction(state, run.id, &Instruction::Interrupt, None, false).await?;
     }
@@ -714,8 +853,13 @@ pub async fn resume(state: &AppState, run: &Run, actor: &str, user: Option<Uuid>
     release_held(state, run.id).await?;
     crate::audit::record(&state.pool, actor, user, "run.resume", Some(run.project_id), Some(run.id), json!({})).await;
     let run = runs::get(state, run.id).await?;
+    let open_question: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM questions WHERE run_id=$1 AND state='open')").bind(run.id).fetch_one(&state.pool).await?;
     if has_pending(state, run.id).await? {
         ensure_runner(state, run.id).await?;
+    } else if run.in_plan_phase() && !open_question {
+        // Paused in the plan phase without a plan under review (no plan, plan budget):
+        // resuming gives the agent another turn to submit one.
+        remind_plan(state, &run).await?;
     } else {
         evaluate(state, &run).await?;
     }

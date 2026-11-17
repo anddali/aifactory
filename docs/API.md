@@ -27,12 +27,13 @@ Timestamps are RFC 3339 strings. IDs are UUID strings unless noted.
  "turns_used": int, "max_turns": int, "needs_you": bool,
  "ticket_key": string|null, "repo": string|null, "pr_number": int|null, "pr_url": string|null,
  "branch": string|null, "assignee": {"id","email","display_name"}|null,
- "model": string, "harness": string, "created_at", "updated_at", "last_activity_at"}
+ "model": string, "harness": string, "phase": "plan"|"build"|null, "created_at", "updated_at", "last_activity_at"}
 ```
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/runs?state=active\|done\|all&project_id=&limit=100` | → `{"runs": [RunSummary]}` newest first. `active` = non-terminal. |
+| GET | `/api/runs?state=active\|done\|all&project_id=&limit=100&status=&workflow=&harness=&model=&repo=&assignee=&q=` | → `{"runs": [RunSummary]}` newest first, only projects the caller can see. `active` = non-terminal. Optional filters: `status` exact run states, comma-separated; `workflow`, `harness`, `model`; `repo` full name; `assignee` a user id or `me`; `q` case-insensitive text matched against title, ticket key, branch and run id, or an exact PR number (`#12` or `12`). |
+| GET | `/api/runs/facets` | → `{"models":[string],"harnesses":[string],"repos":[string],"assignees":[{"id","email","display_name"}]}`: values present in the runs the caller can see, for filter pickers. |
 | POST | `/api/runs` | `{"project_id", "workflow", "ticket_key"?, "repo"? (full name), "pr_number"?, "title"?, "brief"?, "scope"?, "model"?, "budget_usd"?, "max_turns"?}` → `RunSummary` |
 | GET | `/api/runs/{id}` | → `RunDetail` = RunSummary + `{"artifacts":[{"id","kind","title","url","content","created_at"}], "questions":[Question], "cost_by_model":[{"model","input_tokens","output_tokens","cost_usd"}], "event_count": int, "chat_thread": object|null, "template_version", "policy_version", "config_version", "runner": {"state","generation","handle","last_heartbeat_at"}}` |
 | GET | `/api/runs/{id}/events?after=SEQ&before=SEQ&limit=200` | → `{"events":[Event], "total": int, "max_seq": int}`. Without `after`/`before` returns the newest `limit` events. Ascending by seq. |
@@ -44,16 +45,18 @@ Timestamps are RFC 3339 strings. IDs are UUID strings unless noted.
 | POST | `/api/runs/{id}/revive` | `{}` (expired runs inside retention) |
 | POST | `/api/runs/{id}/teardown` | `{}` stops the runner container now (run keeps its state) |
 | POST | `/api/runs/{id}/cap` | `{"action":"raise"\|"end", "max_turns"?, "budget_usd"?}` |
-| POST | `/api/questions/{id}/answer` | `{"answer"?: string, "decision"?: "approved"\|"rejected"}` → Question |
+| POST | `/api/questions/{id}/answer` | `{"answer"?: string, "decision"?: "approved"\|"rejected"\|"changes"}` → Question. For a plan review (`action: "plan"`): `approved` starts the build phase, `changes` (with the changes as `answer`; assignee or operator) sends them back for a revised plan, `rejected` ends the run with outcome `declined`. |
 
 `Event` = `{"seq": int, "ts", "kind": string, "actor": string|null, "payload": object}`.
 Common kinds: `run_created`, `state_changed` (`{from,to,waiting_for,reason}`), `input_received`, `turn_started`, `turn_ended`,
 `harness.model_turn`, `harness.tool_call` (`{call_id,name,args}`), `harness.tool_result`, `harness.agent_message` (`{text}`),
 `harness.usage`, `harness.error`, `primitive_call` (`{name,args,ok,result|error,replayed}`), `human_message` (`{text, direction:"to_human"|"from_human", user}`),
 `question_asked` (`{question_id, kind, text}`), `question_answered`, `steering`, `runner_launched`, `runner_exited`, `runner_lost`,
-`checkpoint_saved`, `cost`, `reminder_sent`, `warning_sent`, `expired`, `artifact`, `status_report`, `cap_reached`, `stuck_detected`.
+`checkpoint_saved`, `cost`, `reminder_sent`, `warning_sent`, `expired`, `artifact`, `status_report`, `cap_reached`, `stuck_detected`,
+`plan_submitted` (`{version, artifact_id, summary}`), `plan_approved`, `plan_changes_requested`, `plan_declined` (`{question_id, note}`),
+`plan_missing` (`{action: "reminded"|"paused"}`), `plan_budget_reached`, `turn_end_enforced` (`{after}`).
 
-`Question` = `{"id","run_id","kind":"question"|"approval","text","action":string|null,"pr_number":int|null,"state":"open"|"answered","answer":string|null,"decision":string|null,"answered_by":string|null,"answered_via":"slack"|"portal"|null,"created_at","answered_at"}`
+`Question` = `{"id","run_id","kind":"question"|"approval","text","action":string|null,"pr_number":int|null,"state":"open"|"answered","answer":string|null,"decision":"approved"|"rejected"|"changes"|"superseded"|null,"answered_by":string|null,"answered_via":"slack"|"portal"|null,"created_at","answered_at"}`
 
 ## Configuration (administer role)
 
@@ -65,8 +68,9 @@ Common kinds: `run_created`, `state_changed` (`{from,to,waiting_for,reason}`), `
 | DELETE | `/api/connectors/{id}` | |
 | PUT | `/api/connectors/{id}/secrets` | `{"secrets": {"name": "value"}}` – values are write-only |
 | POST | `/api/connectors/{id}/test` | → `{"ok": bool, "message": string}` |
+| POST | `/api/connectors/test` | `{"id"?, "kind", "config", "secrets"}`: tests unsaved settings without writing them; blank secrets fall back to the saved ones when `id` is given → `{"ok", "message"}` |
 | GET | `/api/connectors/{id}/repos` | repo host connectors → `{"repos":[{"full_name","default_branch"}]}` |
-| GET | `/api/connector-kinds` | → `{"kinds":[{"kind","role","config_fields":[...],"secret_fields":[...]}]}` |
+| GET | `/api/connector-kinds` | → `{"kinds":[{"kind","label","role","description","config_fields":[{"name","label","type","required","placeholder"?,"help"?,"options"?:[{"value","label"}],"default"?,"show_if"?:{"field","equals"}}],"secret_fields":[...],"webhook_url","webhook_show_if"}]}` (`webhook_url` has `{id}` for the connector id, null when the kind takes no webhooks; `type` `select` comes with `options` and a `default`; a field with `show_if` is shown and required only while that config field, or its default, equals the value; `webhook_show_if` likewise for the webhook) |
 
 `Connector` = `{"id","kind","role":"ticket|repo|chat|model","name","config":{},"secrets":[{"name","hint":"…abcd","updated_at"}],"service_identity":string|null,"created_at"}`
 
@@ -106,6 +110,7 @@ Kinds: `fake_tickets`, `jira`, `fake_repo`, `github`, `azure_devops`, `fake_chat
 | PUT | `/api/users/{id}/grants` | `{"grants":[{"project_id"|null,"role"}]}` |
 | GET | `/api/settings` | → `Settings` |
 | PUT | `/api/settings` | partial `Settings` (merged) |
+| POST | `/api/settings/egress-test` | `{"url"?: string}` (default: the saved `egress_proxy_url`) → `{"ok","proxy","allowed":{"host","ok","detail"},"blocked":{"host","ok","detail"}}`. From the plane, through the proxy: the first allowlisted host must answer and a host not on the allowlist must be refused by the proxy. Nothing is saved. Admin only. |
 | GET | `/api/audit?run_id=&limit=200` | → `{"entries":[{"id","ts","actor","action","project_id","run_id","details"}]}` |
 | GET | `/api/metrics/outcomes` | → `{"rows":[{"project_key","model","harness","runs","approved_prs","approval_rate","avg_review_rounds","avg_hours_to_approval","cost_per_approved_pr"}]}` |
 
@@ -116,7 +121,7 @@ Kinds: `fake_tickets`, `jira`, `fake_repo`, `github`, `azure_devops`, `fake_chat
  "egress_allowlist": ["pypi.org","files.pythonhosted.org","registry.npmjs.org","crates.io","static.crates.io","index.crates.io","api.nuget.org"],
  "deny_patterns": ["rm -rf /", "mkfs", ":(){"],
  "event_retention_days": 90, "tick_ms": 15000, "heartbeat_secs": 10,
- "stuck_repeat_threshold": 5, "stuck_noprogress_turns": 4, "ops_channel": null,
+ "stuck_repeat_threshold": 0, "stuck_noprogress_turns": 4, "ops_channel": null,
  "launcher": "process|docker|fargate"}
 ```
 

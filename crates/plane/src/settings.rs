@@ -82,7 +82,7 @@ impl Default for Settings {
             event_retention_days: 90,
             tick_ms: 15000,
             heartbeat_secs: 10,
-            stuck_repeat_threshold: 5,
+            stuck_repeat_threshold: 0,
             stuck_noprogress_turns: 4,
             ops_channel: None,
             launcher: "process".into(),
@@ -179,6 +179,8 @@ pub struct ProjectConfig {
     pub jira_trigger: JiraTrigger,
     pub review_own_prs: bool,
     pub default_assignee_email: Option<String>,
+    /// Share of the run budget the plan phase may spend before the run pauses (0 = no limit).
+    pub plan_budget_share: f64,
 }
 
 impl Default for ProjectConfig {
@@ -207,6 +209,7 @@ impl Default for ProjectConfig {
             jira_trigger: JiraTrigger::default(),
             review_own_prs: false,
             default_assignee_email: None,
+            plan_budget_share: 0.25,
         }
     }
 }

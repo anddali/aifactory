@@ -41,11 +41,15 @@ async fn copilot_turn_through_metered_model_endpoint_and_mcp_primitives() {
     env.ticket("PROJ-20", "Copilot").await;
     let id = env.start_ticket_run("PROJ-20").await;
     let r = env.wait_run(id, "copilot turn ended", 240, |v| v["state"] == "waiting" && v["turns_used"].as_i64().unwrap_or(0) >= 1).await;
+    assert_eq!(r["waiting_for"], "approval", "the plan phase ends with a plan under review");
     let evs = env.events(id).await;
+    assert!(evs.iter().any(|e| e["kind"] == "primitive_call" && e["payload"]["name"] == "plan.submit" && e["payload"]["ok"] == true), "copilot submitted the plan through MCP");
     assert!(evs.iter().any(|e| e["kind"] == "harness.tool_call" && e["payload"]["name"] == "factory-status_report"), "copilot called the MCP tool");
     assert!(evs.iter().any(|e| e["kind"] == "primitive_call" && e["payload"]["name"] == "status.report" && e["payload"]["ok"] == true), "the MCP call reached the primitive");
     assert!(evs.iter().any(|e| e["kind"] == "status_report" && e["payload"]["text"] == "fake model progress"));
-    assert!(evs.iter().any(|e| e["kind"] == "harness.agent_message"));
+    // The plane stops Copilot as soon as the plan is submitted, instead of trusting the model to stop.
+    assert!(evs.iter().any(|e| e["kind"] == "turn_end_enforced" && e["payload"]["after"] == "plan.submit"), "turn end enforced");
+    assert!(evs.iter().any(|e| e["kind"] == "turn_ended" && e["payload"]["outcome"] == "interrupted"));
     // Metered at the plane endpoint and priced from the price table.
     assert!(r["spent_usd"].as_f64().unwrap() > 0.0, "cost recorded: {r}");
     assert!(r["tokens_in"].as_i64().unwrap() > 0);

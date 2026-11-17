@@ -26,9 +26,44 @@ async fn repo_lock(state: &AppState, repo_id: Uuid) -> Arc<tokio::sync::Mutex<()
 fn upstream_config(remote: &crate::connectors::GitRemote) -> Vec<String> {
     let mut c = vec!["core.askPass=".to_string(), "credential.helper=".to_string()];
     if let Some(h) = &remote.auth_header {
-        c.push(format!("http.extraHeader={h}"));
+        // `auth_header` is the header value; git wants the whole header line.
+        c.push(format!("http.extraHeader=Authorization: {h}"));
     }
     c
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::*;
+
+    #[test]
+    fn upstream_config_sends_a_full_authorization_header() {
+        let r = crate::connectors::GitRemote { url: "https://github.com/a/b.git".into(), auth_header: Some("Basic abc=".into()) };
+        assert_eq!(upstream_config(&r), vec!["core.askPass=", "credential.helper=", "http.extraHeader=Authorization: Basic abc="]);
+        let r = crate::connectors::GitRemote { url: "/tmp/x".into(), auth_header: None };
+        assert_eq!(upstream_config(&r).len(), 2);
+    }
+
+    /// Against a live HTTP server: git must send the header as `Authorization`.
+    #[tokio::test]
+    async fn git_sends_the_authorization_header() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen2 = seen.clone();
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let seen = seen2.clone();
+            async move {
+                seen.lock().unwrap().push(headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
+                (axum::http::StatusCode::NOT_FOUND, "")
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/a/b.git", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let r = crate::connectors::GitRemote { url: url.clone(), auth_header: Some("Basic abc=".into()) };
+        let _ = git_raw(None, &["ls-remote", &url], None, &upstream_config(&r)).await.unwrap();
+        assert_eq!(seen.lock().unwrap().first().map(String::as_str), Some("Basic abc="));
+    }
 }
 
 /// Bring the mirror up to date with upstream. Caller holds the repo lock.
@@ -69,6 +104,13 @@ pub fn check_ref(run: &Run, r: &RepoRow, refname: &str, deletion: bool) -> Resul
     let ok = branch == ns || branch.starts_with(&format!("{ns}-")) || branch == run.wip_branch();
     if !ok {
         return Err(deny("branch_namespace", format!("{branch} is outside the run's namespace {ns}")));
+    }
+    // Checkpoints (the wip branch) are always allowed, so no work is lost.
+    if run.in_plan_phase() && branch != run.wip_branch() {
+        return Err(deny(
+            "plan_phase",
+            format!("the plan is not approved yet: nothing can be pushed to {branch} and no pull request opened until a human approves it. Submit your plan with plan.submit."),
+        ));
     }
     Ok(())
 }

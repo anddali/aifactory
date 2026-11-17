@@ -23,6 +23,7 @@ type NumKey =
   | 'max_concurrent_runs'
   | 'daily_spend_usd'
   | 'review_round_limit'
+  | 'plan_budget_share'
   | 'idle_reminder_secs'
   | 'idle_warning_secs'
   | 'idle_expiry_secs'
@@ -38,6 +39,7 @@ const BUDGET_FIELDS: [NumKey, string][] = [
   ['max_concurrent_runs', 'Max concurrent runs'],
   ['daily_spend_usd', 'Daily spend cap (USD)'],
   ['review_round_limit', 'Review round limit'],
+  ['plan_budget_share', 'Plan budget (share of run budget, 0-1)'],
 ];
 const LIFETIME_FIELDS: [NumKey, string][] = [
   ['idle_reminder_secs', 'Idle reminder after (s)'],

@@ -6,7 +6,7 @@ use crate::connectors::{self, RepoHost};
 use crate::engine::{self, RepoRow};
 use crate::runs::{self, Run};
 use crate::{AppState, events, humans};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use proto::WorkflowKind;
 use proto::primitives::{self as cat, PrimitiveResponse};
 use serde_json::{Value, json};
@@ -152,6 +152,11 @@ pub async fn call(state: &AppState, run: &Run, name: &str, args: Value, key: &st
     )
     .await;
     crate::audit::record(&state.pool, &format!("run:{}", run.id), None, &format!("primitive.{name}"), Some(run.project_id), Some(run.id), json!({"args": args, "ok": resp.ok, "error": resp.error})).await;
+    if resp.ok && resp.ends_turn {
+        if let Err(e) = engine::end_turn_now(state, run.id, name).await {
+            tracing::warn!(run = %run.id, "could not stop the turn after {name}: {e:#}");
+        }
+    }
     resp
 }
 
@@ -338,6 +343,36 @@ async fn exec(c: &Ctx<'_>, name: &str) -> Result<(Value, bool)> {
             let text = format!("{} — {}", action, c.req("summary")?);
             let q = humans::ask(st, run, c.key, "approval", &text, Some(&action), pr).await?;
             return Ok((json!({"question_id": q, "note": "End your turn now. The decision will start your next turn."}), true));
+        }
+        // ---- plan ----
+        "plan.submit" => {
+            if !run.in_plan_phase() {
+                bail!(if run.phase.as_deref() == Some("build") {
+                    "the plan is already approved; you are in the build phase. If the plan needs a material change, ask with human.ask"
+                } else {
+                    "this workflow has no plan phase"
+                });
+            }
+            let plan = c.req("plan")?;
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE run_id=$1 AND kind='plan'").bind(run.id).fetch_one(&st.pool).await?;
+            let version = n + 1;
+            let title = format!("Plan v{version}");
+            let artifact = add_artifact(st, run, "plan", &title, None, Some(&plan)).await?;
+            events::append(&st.pool, &*st.blobs, run.id, "plan_submitted", Some("agent"), json!({"version": version, "artifact_id": artifact, "summary": c.s("summary")})).await?;
+            let summary = c.s("summary").map(|s| format!("{s}\n\n")).unwrap_or_default();
+            // Earlier versions still open for review are superseded by this one.
+            let superseded: Vec<uuid::Uuid> = sqlx::query_scalar(
+                "UPDATE questions SET state='answered', decision='superseded', answered_at=now() WHERE run_id=$1 AND action='plan' AND state='open' RETURNING id",
+            )
+            .bind(run.id)
+            .fetch_all(&st.pool)
+            .await?;
+            for old in superseded {
+                st.jobs.push(crate::jobs::Job::ChatUpdate { question_id: old, text: format!("Superseded by {title}.") }, Some(format!("chat-update:{old}"))).await?;
+            }
+            let text = format!("{title} for {}\n\n{summary}{}", run.title, humans::excerpt(&plan, 2500));
+            let q = humans::ask(st, run, c.key, "approval", &text, Some("plan"), None).await?;
+            return Ok((json!({"question_id": q, "version": version, "note": "Plan submitted. End your turn now. The reviewer's decision will start your next turn."}), true));
         }
         // ---- status ----
         "status.report" => {

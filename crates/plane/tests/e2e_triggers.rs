@@ -65,7 +65,7 @@ async fn approval_by_slack_button_first_answer_wins_and_portal_updates() {
     let env = Env::new(Opts::default()).await;
     env.ticket("PROJ-34", "Approve").await;
     let id = env.start_ticket_run("PROJ-34").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     env.post(&format!("/api/runs/{id}/pause"), json!({})).await;
     env.wait_run(id, "paused", 30, |v| v["state"] == "paused" && v["runner"]["state"] != "alive").await;
     let token = env.run_token(id).await;
@@ -89,10 +89,26 @@ async fn approval_by_slack_button_first_answer_wins_and_portal_updates() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let q = env.run(id).await["questions"].as_array().unwrap().iter().find(|q| q["id"] == qid.as_str()).unwrap().clone();
     assert_eq!(q["state"], "open");
-    // Alice presses Approve in Slack.
-    env.post(&format!("/api/fake/{}/chat/reply", env.chat), json!({"user": "U-alice", "action": [qid, "approved"]})).await;
+    // Bob is told why it did not count.
+    env.wait_chat("<@U-bob> Your decision wasn't recorded: you do not hold the approve role", 30).await;
+    // Someone with no factory user at all is told how to get linked.
+    env.post(&format!("/api/fake/{}/chat/reply", env.chat), json!({"user": "U-zed", "action": [qid, "approved"]})).await;
+    env.wait_chat("<@U-zed> I couldn't match your Slack account to a factory user", 30).await;
+    // Carol has a factory user (with the approve role) but no Slack identity: her first press
+    // links her by email and counts.
+    let carol = env.post("/api/users", json!({"email": "carol@example.test"})).await;
+    let carol_id = carol["id"].as_str().unwrap().to_string();
+    env.put(&format!("/api/users/{carol_id}/grants"), json!({"grants": [{"project_id": env.project, "role": "approve"}]})).await;
+    env.post(&format!("/api/fake/{}/chat/reply", env.chat), json!({"user": "U-carol", "action": [qid, "approved"]})).await;
     env.wait_run(id, "approved via slack", 30, |v| v["questions"].as_array().unwrap().iter().any(|q| q["id"] == qid.as_str() && q["state"] == "answered")).await;
+    let linked: Option<String> = sqlx::query_scalar("SELECT u.email FROM identities i JOIN users u ON u.id=i.user_id WHERE i.provider='slack' AND i.external_id='U-carol'").fetch_optional(&env.pool).await.unwrap();
+    assert_eq!(linked.as_deref(), Some("carol@example.test"), "linked by email");
     let q = env.run(id).await["questions"].as_array().unwrap().iter().find(|q| q["id"] == qid.as_str()).unwrap().clone();
+    assert_eq!(q["answered_by"], "carol@example.test");
+    // Alice presses Approve in Slack too late: already decided, and she is told.
+    env.post(&format!("/api/fake/{}/chat/reply", env.chat), json!({"user": "U-alice", "action": [qid, "approved"]})).await;
+    env.wait_chat("<@U-alice> Your decision wasn't recorded: this question was already answered", 30).await;
+    env.wait_run(id, "approved via slack", 30, |v| v["questions"].as_array().unwrap().iter().any(|q| q["id"] == qid.as_str() && q["state"] == "answered")).await;
     assert_eq!(q["answered_via"], "slack");
     assert_eq!(q["decision"], "approved");
     // The portal answer that comes second is refused.
@@ -100,7 +116,7 @@ async fn approval_by_slack_button_first_answer_wins_and_portal_updates() {
     let (s, _) = env.req(reqwest::Method::POST, &format!("/api/questions/{qid}/answer"), Some(json!({"decision": "rejected"})), &alice).await;
     assert_eq!(s, 409);
     // The Slack message shows the outcome.
-    env.wait_chat("approved by alice@example.test via slack", 30).await;
+    env.wait_chat("approved by carol@example.test via slack", 30).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -167,4 +183,31 @@ async fn webhooks_verify_signatures() {
     assert_eq!(r.status().as_u16(), 401);
     let m = env.http.get(format!("{}/metrics", env.url())).send().await.unwrap().text().await.unwrap();
     assert!(m.contains("webhook_signature"));
+}
+
+/// Ticket keys are normalised to the ticket system's own key, so a differently spelled key
+/// cannot start a second run for the same ticket.
+#[tokio::test(flavor = "multi_thread")]
+async fn ticket_keys_are_canonical_and_spellings_do_not_duplicate_runs() {
+    let env = Env::new(Opts::default()).await;
+    env.ticket("PROJ-33", "Key casing").await;
+    let id = env.start_ticket_run(" proj-33 ").await;
+    let r = env.run(id).await;
+    assert_eq!(r["ticket_key"], "PROJ-33");
+    assert!(r["title"].as_str().unwrap().starts_with("PROJ-33: "), "{}", r["title"]);
+    let (status, body) = env.post_status("/api/runs", json!({"project_id": env.project, "workflow": "ticket_build", "ticket_key": "PROJ-33"})).await;
+    assert_eq!(status, 409, "{body}");
+    let (status, _) = env.post_status("/api/runs", json!({"project_id": env.project, "workflow": "ticket_build", "ticket_key": "Proj-33"})).await;
+    assert_eq!(status, 409);
+    // The start input is written by the run's start job, shortly after creation.
+    let mut input = None;
+    for _ in 0..60 {
+        input = sqlx::query_scalar::<_, String>("SELECT text FROM inputs WHERE run_id=$1 AND kind='start'").bind(id).fetch_optional(&env.pool).await.unwrap();
+        if input.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let input = input.expect("start input");
+    assert!(input.contains("**PROJ-33**") && !input.contains("proj-33"), "prompt uses the canonical key");
 }

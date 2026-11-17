@@ -18,6 +18,23 @@ pub fn builtin(w: WorkflowKind) -> &'static str {
     }
 }
 
+/// Workflows that plan first and build only after a human approves the plan.
+pub fn two_phase(w: WorkflowKind) -> bool {
+    matches!(w, WorkflowKind::TicketBuild | WorkflowKind::AdHoc)
+}
+
+/// Line separating a two-phase template's plan instructions from its build instructions.
+pub const BUILD_MARKER: &str = "<!-- build phase -->";
+
+/// Split a template into (plan part, build part). Without the marker the whole template is
+/// the first part and there is no build part.
+pub fn split_phases(t: &str) -> (&str, Option<&str>) {
+    match t.find(BUILD_MARKER) {
+        Some(i) => (t[..i].trim_end(), Some(t[i + BUILD_MARKER.len()..].trim_start())),
+        None => (t, None),
+    }
+}
+
 pub fn version_of(body: &str) -> String {
     crate::crypto::sha256_hex(body.as_bytes())[..12].to_string()
 }
@@ -60,10 +77,52 @@ pub fn render(t: &str, vars: &[(&str, String)]) -> String {
     out
 }
 
-/// The first input of a run: the rendered instructions and structured data.
+/// The build instructions of a two-phase run, delivered when its plan is approved. A project
+/// template without the build marker gets the built-in build instructions.
+pub async fn build_instructions(state: &AppState, run: &Run) -> Result<String> {
+    let w = run.workflow();
+    let (body, _) = template(state, run.project_id, w).await?;
+    let build = match split_phases(&body).1 {
+        Some(b) => b.to_string(),
+        None => split_phases(builtin(w)).1.unwrap_or("").to_string(),
+    };
+    let (vars, _) = template_vars(state, run).await?;
+    let vars: Vec<(&str, String)> = vars.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let mut out = build;
+    for (k, v) in &vars {
+        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    Ok(out)
+}
+
+/// The first input of a run: the rendered instructions and structured data. For a two-phase
+/// workflow only the plan part of the template.
 pub async fn start_input(state: &AppState, run: &Run) -> Result<(String, Value)> {
     let w = run.workflow();
     let (body, _) = template(state, run.project_id, w).await?;
+    let body = if run.in_plan_phase() { split_phases(&body).0.to_string() } else { body };
+    let (vars, repo) = template_vars(state, run).await?;
+    let text = render(&body, &vars.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>());
+    let data = start_data(run, repo.as_ref());
+    Ok((text, data))
+}
+
+fn start_data(run: &Run, repo: Option<&crate::engine::RepoRow>) -> Value {
+    json!({
+        "workflow": run.workflow().as_str(),
+        "ticket_key": run.ticket_key,
+        "repo": repo.map(|r| r.full_name.clone()),
+        "branch": run.branch,
+        "base_branch": run.base_branch,
+        "pr_number": run.pr_number,
+        "brief": run.brief,
+        "scope": run.scope,
+        "title": run.title,
+        "phase": run.phase,
+    })
+}
+
+async fn template_vars(state: &AppState, run: &Run) -> Result<(Vec<(&'static str, String)>, Option<crate::engine::RepoRow>)> {
     let repo = match run.repo_id {
         Some(id) => Some(crate::engine::repo(state, id).await?),
         None => None,
@@ -90,19 +149,7 @@ pub async fn start_input(state: &AppState, run: &Run) -> Result<(String, Value)>
         ("brief", run.brief.clone().unwrap_or_default()),
         ("scope", run.scope.clone().unwrap_or_else(|| "report first, fix on confirmation".into())),
     ];
-    let text = render(&body, &vars);
-    let data = json!({
-        "workflow": w.as_str(),
-        "ticket_key": run.ticket_key,
-        "repo": repo.as_ref().map(|r| r.full_name.clone()),
-        "branch": run.branch,
-        "base_branch": run.base_branch,
-        "pr_number": run.pr_number,
-        "brief": run.brief,
-        "scope": run.scope,
-        "title": run.title,
-    });
-    Ok((text, data))
+    Ok((vars.to_vec(), repo))
 }
 
 /// A handoff summary built from the run's event log, used to seed a fresh

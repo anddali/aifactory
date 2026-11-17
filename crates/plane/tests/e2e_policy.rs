@@ -41,7 +41,7 @@ async fn each_policy_rule_refuses() {
     let env = Env::new(Opts::default()).await;
     env.ticket("PROJ-9", "Policy").await;
     let id = env.start_ticket_run("PROJ-9").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     // Park the runner so the test acts as the agent.
     env.post(&format!("/api/runs/{id}/pause"), json!({})).await;
     env.wait_run(id, "runner stopped", 30, |v| v["state"] == "paused" && v["runner"]["state"] != "alive").await;
@@ -79,6 +79,16 @@ async fn each_policy_rule_refuses() {
     // Outside the run's namespace.
     let (ok, _) = git(&w, &token, &["push", "origin", "HEAD:refs/heads/feature/x"]);
     assert!(!ok, "push outside namespace refused");
+    // Plan phase: nothing reaches the run's branch and no PR opens until the plan is approved.
+    let (ok, e) = git(&w, &token, &["push", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    assert!(!ok, "own branch push refused in the plan phase: {e}");
+    let r = prim(&env, &token, "pr.open", json!({"title": "early", "body": "too soon"})).await;
+    assert_eq!(r["ok"], false);
+    assert!(r["error"].as_str().unwrap().contains("plan is not approved"), "{r}");
+    let denials: i64 = sqlx::query_scalar("SELECT count(*) FROM audit WHERE run_id=$1 AND action='policy.denied' AND details->>'rule'='plan_phase'").bind(id).fetch_one(&env.pool).await.unwrap();
+    assert!(denials >= 1, "plan-phase denial audited");
+    // From here on act as a run whose plan was approved.
+    sqlx::query("UPDATE runs SET phase='build' WHERE id=$1").bind(id).execute(&env.pool).await.unwrap();
     // Own branch accepted.
     let (ok, e) = git(&w, &token, &["push", "origin", &format!("HEAD:refs/heads/{branch}")]);
     assert!(ok, "own branch push: {e}");
@@ -153,7 +163,7 @@ async fn secrets_are_encrypted_hidden_and_absent_from_runners() {
 
     env.ticket("PROJ-8", "Env").await;
     let id = env.start_ticket_run("PROJ-8").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     // The runner's environment holds only its run token and plane URLs.
     let root = env.replicas[0].data_dir.join("runners");
     let mut found = false;

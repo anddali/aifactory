@@ -232,6 +232,9 @@ pub struct ChatMessage {
     /// External ids to mention.
     #[serde(default)]
     pub mention: Option<String>,
+    /// Labels for the approve and reject buttons (default: Approve, Reject).
+    #[serde(default)]
+    pub button_labels: Option<(String, String)>,
 }
 
 // ---------- roles ----------
@@ -280,29 +283,252 @@ pub trait Chat: Send + Sync {
     async fn update(&self, msg_ref: &ChatRef, text: &str) -> Result<()>;
     async fn find_by_marker(&self, channel: &str, marker: &str) -> Result<Option<ChatRef>>;
     async fn lookup_user_by_email(&self, email: &str) -> Result<Option<String>>;
+    /// The email address of a chat user, if the service exposes it.
+    async fn user_email(&self, user: &str) -> Result<Option<String>>;
 }
 
 // ---------- registry ----------
 
-pub struct KindInfo {
-    pub kind: &'static str,
-    pub role: &'static str,
-    pub config_fields: &'static [&'static str],
-    pub secret_fields: &'static [&'static str],
+/// One choice of a `select` field.
+#[derive(Serialize, Clone, Copy)]
+pub struct Choice {
+    pub value: &'static str,
+    pub label: &'static str,
 }
 
+/// Show (and require) a field only while another config field has a given value.
+#[derive(Serialize, Clone, Copy)]
+pub struct ShowIf {
+    pub field: &'static str,
+    pub equals: &'static str,
+}
+
+/// One configuration or secret field of a connector kind, as the portal shows it.
+#[derive(Serialize, Clone, Copy)]
+pub struct Field {
+    pub name: &'static str,
+    pub label: &'static str,
+    /// string | url | email | list (comma-separated, stored as a JSON array)
+    #[serde(rename = "type")]
+    pub ty: &'static str,
+    pub required: bool,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub placeholder: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub help: &'static str,
+    /// Choices of a `select` field.
+    #[serde(skip_serializing_if = "<[Choice]>::is_empty")]
+    pub options: &'static [Choice],
+    /// Value assumed when the field is not set.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub default: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_if: Option<ShowIf>,
+}
+
+const fn field(name: &'static str, label: &'static str, ty: &'static str, required: bool, placeholder: &'static str, help: &'static str) -> Field {
+    Field { name, label, ty, required, placeholder, help, options: &[], default: "", show_if: None }
+}
+
+impl Field {
+    /// A `select` field with these choices and default.
+    const fn select(self, options: &'static [Choice], default: &'static str) -> Field {
+        Field { ty: "select", options, default, ..self }
+    }
+    /// Only shown, and only required, while config field `field` equals `equals`.
+    const fn when(self, field: &'static str, equals: &'static str) -> Field {
+        Field { show_if: Some(ShowIf { field, equals }), ..self }
+    }
+}
+
+impl KindInfo {
+    /// Effective value of a config field: the stored value or the field's default.
+    pub fn config_value(&self, l: &Loaded, name: &str) -> Option<String> {
+        l.cfg(name).or_else(|| self.config_fields.iter().find(|f| f.name == name).map(|f| f.default.to_string()).filter(|d| !d.is_empty()))
+    }
+    /// Whether a field applies under the connector's current configuration.
+    pub fn applies(&self, l: &Loaded, f: &Field) -> bool {
+        f.show_if.is_none_or(|c| self.config_value(l, c.field).as_deref() == Some(c.equals))
+    }
+}
+
+pub struct KindInfo {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub role: &'static str,
+    pub description: &'static str,
+    pub config_fields: &'static [Field],
+    pub secret_fields: &'static [Field],
+    /// Path segment of the inbound webhook route (`/webhooks/{segment}/{connector id}`), if any.
+    pub webhook: Option<&'static str>,
+    /// The webhook applies only while this holds (e.g. not in Slack Socket Mode).
+    pub webhook_show_if: Option<ShowIf>,
+}
+
+/// Which OpenAI API the harness speaks to a model connector.
+const WIRE_API: Field = field(
+    "wire_api",
+    "Wire API",
+    "select",
+    false,
+    "",
+    "Chat Completions works with any OpenAI-compatible endpoint. Use Responses for newer OpenAI models, which refuse tool calls with reasoning on Chat Completions.",
+)
+.select(&[Choice { value: "completions", label: "Chat Completions (/chat/completions)" }, Choice { value: "responses", label: "Responses (/responses)" }], "completions");
+
+const WEBHOOK_SECRET: Field = field(
+    "webhook_secret",
+    "Webhook secret",
+    "string",
+    false,
+    "",
+    "Optional. Shared secret that signs inbound webhooks; without it webhooks are refused and the factory relies on polling.",
+);
+
 pub const KINDS: &[KindInfo] = &[
-    KindInfo { kind: "fake_tickets", role: "ticket", config_fields: &[], secret_fields: &[] },
-    KindInfo { kind: "jira", role: "ticket", config_fields: &["base_url", "email", "project_keys", "webhook_path"], secret_fields: &["api_token", "webhook_secret"] },
-    KindInfo { kind: "fake_repo", role: "repo", config_fields: &["root", "protected"], secret_fields: &[] },
-    KindInfo { kind: "github", role: "repo", config_fields: &["api_url", "owner"], secret_fields: &["token", "webhook_secret"] },
-    KindInfo { kind: "azure_devops", role: "repo", config_fields: &["org_url", "project"], secret_fields: &["pat", "webhook_secret"] },
-    KindInfo { kind: "fake_chat", role: "chat", config_fields: &[], secret_fields: &[] },
-    KindInfo { kind: "slack", role: "chat", config_fields: &["api_url"], secret_fields: &["bot_token", "signing_secret"] },
-    KindInfo { kind: "fake_model", role: "model", config_fields: &["base_url"], secret_fields: &["api_key"] },
-    KindInfo { kind: "direct_model", role: "model", config_fields: &["base_url"], secret_fields: &["api_key"] },
-    KindInfo { kind: "litellm", role: "model", config_fields: &["base_url", "runner_base_url"], secret_fields: &["master_key"] },
-    KindInfo { kind: "package_feed", role: "feed", config_fields: &["name", "upstream"], secret_fields: &["auth_header"] },
+    KindInfo {
+        kind: "jira",
+        label: "Jira Cloud",
+        role: "ticket",
+        description: "Tickets from Jira Cloud (REST API v3).",
+        webhook: Some("jira"),
+        webhook_show_if: None,
+        config_fields: &[
+            field("base_url", "Site URL", "url", true, "https://acme.atlassian.net", ""),
+            field("email", "Account email", "email", true, "factory-bot@acme.com", "The Atlassian account that owns the API token."),
+            field(
+                "project_keys",
+                "Project keys",
+                "string",
+                false,
+                "PROJ, OPS",
+                "Jira project keys (not credentials), comma-separated. Limits search and polling to these projects; leave empty for every project the account can see.",
+            ),
+            field(
+                "repo_field",
+                "Repository field",
+                "string",
+                false,
+                "customfield_10050",
+                "Optional custom field holding the target repository. Without it, a label like repo:owner/name is used.",
+            ),
+        ],
+        secret_fields: &[field("api_token", "API token", "string", true, "", "Create one at id.atlassian.com → Security → API tokens."), WEBHOOK_SECRET],
+    },
+    KindInfo {
+        kind: "github",
+        label: "GitHub",
+        role: "repo",
+        description: "Repositories on github.com or GitHub Enterprise Server.",
+        webhook: Some("github"),
+        webhook_show_if: None,
+        config_fields: &[
+            field("api_url", "API URL", "url", false, "https://api.github.com", "Change only for GitHub Enterprise Server (https://<host>/api/v3)."),
+            field("owner", "Owner", "string", false, "acme", "User or organisation to list repositories from. Leave empty for everything the token can see."),
+        ],
+        secret_fields: &[field("token", "Access token", "string", true, "", "Fine-grained or classic personal access token, or an installation token."), WEBHOOK_SECRET],
+    },
+    KindInfo {
+        kind: "azure_devops",
+        label: "Azure DevOps",
+        role: "repo",
+        description: "Azure Repos and Pipelines in one Azure DevOps project.",
+        webhook: Some("azure-devops"),
+        webhook_show_if: None,
+        config_fields: &[
+            field("org_url", "Organisation URL", "url", true, "https://dev.azure.com/acme", ""),
+            field("project", "Project", "string", true, "Platform", ""),
+            field("search_url", "Code Search URL", "url", false, "https://almsearch.dev.azure.com/acme", "Derived automatically for dev.azure.com."),
+        ],
+        secret_fields: &[
+            field("pat", "Personal access token", "string", true, "", "Needs Code (read & write), Pull Request Threads and Build (read)."),
+            field("webhook_secret", "Service hook password", "string", false, "", "Optional. Basic-auth password configured on the service hook."),
+        ],
+    },
+    KindInfo {
+        kind: "slack",
+        label: "Slack",
+        role: "chat",
+        description: "Questions, approvals and updates in Slack.",
+        webhook: Some("slack"),
+        webhook_show_if: Some(ShowIf { field: "mode", equals: "http" }),
+        config_fields: &[
+            field(
+                "mode",
+                "Connection mode",
+                "select",
+                false,
+                "",
+                "How Slack delivers replies and button presses. HTTP: Slack calls the webhook URL below, so the plane must be reachable over public HTTPS. Socket Mode: the plane opens an outbound WebSocket to Slack; no public URL needed.",
+            )
+            .select(&[Choice { value: "http", label: "HTTP (Events API)" }, Choice { value: "socket", label: "Socket Mode (WebSocket)" }], "http"),
+            field("api_url", "API URL", "url", false, "https://slack.com/api", "Change only for testing against a mock."),
+        ],
+        secret_fields: &[
+            field("bot_token", "Bot token", "string", true, "xoxb-…", ""),
+            field("signing_secret", "Signing secret", "string", false, "", "From the Slack app's Basic Information page; needed for buttons and events.").when("mode", "http"),
+            field("app_token", "App-level token", "string", true, "xapp-…", "From Basic Information → App-Level Tokens, with the connections:write scope.").when("mode", "socket"),
+        ],
+    },
+    KindInfo {
+        kind: "direct_model",
+        label: "Model provider",
+        role: "model",
+        description: "An OpenAI-compatible model endpoint.",
+        webhook: None,
+        webhook_show_if: None,
+        config_fields: &[field("base_url", "Base URL", "url", true, "https://api.example.com/v1", ""), WIRE_API],
+        secret_fields: &[field("api_key", "API key", "string", false, "", "")],
+    },
+    KindInfo {
+        kind: "litellm",
+        label: "LiteLLM proxy",
+        role: "model",
+        description: "A LiteLLM proxy that issues per-run virtual keys.",
+        webhook: None,
+        webhook_show_if: None,
+        config_fields: &[
+            field("base_url", "Base URL", "url", true, "http://litellm:4000", "Where the plane reaches the proxy."),
+            field("runner_base_url", "Runner base URL", "url", false, "", "Where runners reach the proxy, if different."),
+            WIRE_API,
+        ],
+        secret_fields: &[field("master_key", "Master key", "string", true, "sk-…", "")],
+    },
+    KindInfo {
+        kind: "package_feed",
+        label: "Package feed",
+        role: "feed",
+        description: "Authenticated upstream package feed served through the egress proxy.",
+        webhook: None,
+        webhook_show_if: None,
+        config_fields: &[
+            field("name", "Feed name", "string", true, "npm-internal", "Runners reach the feed under this name on the egress proxy."),
+            field("upstream", "Upstream URL", "url", true, "https://pkgs.example.com/npm/", ""),
+        ],
+        secret_fields: &[field("auth_header", "Authorization header", "string", false, "Bearer …", "Full header value the proxy adds upstream.")],
+    },
+    KindInfo { kind: "fake_tickets", label: "Fake tickets (testing)", role: "ticket", description: "In-database tickets for rehearsals.", webhook: None, webhook_show_if: None, config_fields: &[], secret_fields: &[] },
+    KindInfo {
+        kind: "fake_repo",
+        label: "Fake repo (testing)",
+        role: "repo",
+        description: "Local git repositories for rehearsals.",
+        webhook: None,
+        webhook_show_if: None,
+        config_fields: &[field("root", "Root directory", "string", true, "/data/fake-repos", ""), field("protected", "Protected branches", "list", false, "release, prod", "Comma-separated.")],
+        secret_fields: &[],
+    },
+    KindInfo { kind: "fake_chat", label: "Fake chat (testing)", role: "chat", description: "In-database chat for rehearsals.", webhook: None, webhook_show_if: None, config_fields: &[], secret_fields: &[] },
+    KindInfo {
+        kind: "fake_model",
+        label: "Fake model (testing)",
+        role: "model",
+        description: "Scripted model endpoint for rehearsals.",
+        webhook: None,
+        webhook_show_if: None,
+        config_fields: &[field("base_url", "Base URL", "url", false, "", "Defaults to the plane's built-in fake model.")],
+        secret_fields: &[field("api_key", "API key", "string", false, "", "")],
+    },
 ];
 
 pub fn kind_info(kind: &str) -> Option<&'static KindInfo> {
@@ -360,29 +586,38 @@ pub async fn load(state: &AppState, id: Uuid) -> Result<Loaded> {
 }
 
 pub async fn ticket_source(state: &AppState, id: Uuid) -> Result<Arc<dyn TicketSource>> {
-    let l = load(state, id).await?;
+    ticket_source_from(state, &load(state, id).await?)
+}
+
+fn ticket_source_from(state: &AppState, l: &Loaded) -> Result<Arc<dyn TicketSource>> {
     Ok(match l.row.kind.as_str() {
         "fake_tickets" => Arc::new(fake::FakeTickets::new(state.pool.clone(), l.row.id)),
-        "jira" => Arc::new(jira::Jira::from_loaded(&l)?),
+        "jira" => Arc::new(jira::Jira::from_loaded(l)?),
         k => bail!("connector kind {k} is not a ticket source"),
     })
 }
 
 pub async fn repo_host(state: &AppState, id: Uuid) -> Result<Arc<dyn RepoHost>> {
-    let l = load(state, id).await?;
+    repo_host_from(state, &load(state, id).await?)
+}
+
+fn repo_host_from(state: &AppState, l: &Loaded) -> Result<Arc<dyn RepoHost>> {
     Ok(match l.row.kind.as_str() {
-        "fake_repo" => Arc::new(fake::FakeRepo::from_loaded(state.pool.clone(), &l)?),
-        "github" => Arc::new(github::GitHub::from_loaded(&l)?),
-        "azure_devops" => Arc::new(ado::AzureDevOps::from_loaded(&l)?),
+        "fake_repo" => Arc::new(fake::FakeRepo::from_loaded(state.pool.clone(), l)?),
+        "github" => Arc::new(github::GitHub::from_loaded(l)?),
+        "azure_devops" => Arc::new(ado::AzureDevOps::from_loaded(l)?),
         k => bail!("connector kind {k} is not a repo host"),
     })
 }
 
 pub async fn chat(state: &AppState, id: Uuid) -> Result<Arc<dyn Chat>> {
-    let l = load(state, id).await?;
+    chat_from(state, &load(state, id).await?)
+}
+
+fn chat_from(state: &AppState, l: &Loaded) -> Result<Arc<dyn Chat>> {
     Ok(match l.row.kind.as_str() {
         "fake_chat" => Arc::new(fake::FakeChat::new(state.pool.clone(), l.row.id)),
-        "slack" => Arc::new(slack::Slack::from_loaded(&l)?),
+        "slack" => Arc::new(slack::Slack::from_loaded(l)?),
         k => bail!("connector kind {k} is not a chat connector"),
     })
 }
@@ -397,14 +632,47 @@ pub async fn service_identity(state: &AppState, id: Uuid) -> Option<String> {
         .flatten()
 }
 
-/// "Test connection" for any connector kind.
+/// "Test connection" for a saved connector.
 pub async fn test(state: &AppState, id: Uuid) -> Result<String> {
-    let l = load(state, id).await?;
+    test_loaded(state, &load(state, id).await?).await
+}
+
+/// "Test connection" for settings that may not be saved yet: `config` replaces the stored
+/// configuration and non-empty `secrets` override the stored ones (when `id` names a saved
+/// connector). Nothing is written.
+pub async fn test_draft(state: &AppState, id: Option<Uuid>, kind: &str, config: Value, secrets: HashMap<String, String>) -> Result<String> {
+    let info = kind_info(kind).ok_or_else(|| anyhow!("unknown connector kind {kind}"))?;
+    let mut l = match id {
+        Some(id) => load(state, id).await?,
+        None => Loaded {
+            row: ConnectorRow { id: Uuid::new_v4(), kind: kind.into(), role: info.role.into(), name: "draft".into(), config: json!({}), service_identity: None },
+            secrets: HashMap::new(),
+        },
+    };
+    if l.row.kind != kind {
+        bail!("connector kind cannot change");
+    }
+    l.row.config = config;
+    l.secrets.extend(secrets.into_iter().filter(|(_, v)| !v.is_empty()));
+    for f in info.config_fields.iter().filter(|f| f.required && info.applies(&l, f)) {
+        if l.cfg(f.name).is_none() && !l.row.config.get(f.name).is_some_and(|v| v.is_array()) {
+            bail!("{} is required", f.label);
+        }
+    }
+    for f in info.secret_fields.iter().filter(|f| f.required && info.applies(&l, f)) {
+        if !l.secrets.contains_key(f.name) {
+            bail!("{} is required", f.label);
+        }
+    }
+    test_loaded(state, &l).await
+}
+
+async fn test_loaded(state: &AppState, l: &Loaded) -> Result<String> {
     match l.row.role.as_str() {
-        "ticket" => ticket_source(state, id).await?.test_connection().await,
-        "repo" => repo_host(state, id).await?.test_connection().await,
-        "chat" => chat(state, id).await?.test_connection().await,
-        "model" => model::test_connection(state, &l).await,
+        "ticket" => ticket_source_from(state, l)?.test_connection().await,
+        "repo" => repo_host_from(state, l)?.test_connection().await,
+        "chat" => chat_from(state, l)?.test_connection().await,
+        "model" => model::test_connection(state, l).await,
         "feed" => Ok("feed credentials stored; used by the egress proxy".into()),
         r => bail!("unknown role {r}"),
     }

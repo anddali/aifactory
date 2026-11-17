@@ -255,6 +255,10 @@ pub struct ModelAccess {
     /// Run-scoped key. Never a provider key.
     pub api_key: String,
     pub model: String,
+    /// OpenAI API shape the harness should speak: `completions` (`/chat/completions`) or
+    /// `responses` (`/responses`). None: the harness default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

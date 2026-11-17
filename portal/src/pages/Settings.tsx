@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { api, type Launcher, type ModelPrice, type Settings } from '../api';
+import { api, type EgressTest, type Launcher, type ModelPrice, type Settings } from '../api';
 import { ListEditor } from '../components/ListEditor';
 import { useToast } from '../components/Toast';
 import { useLoad } from '../lib/usePoll';
@@ -10,7 +10,7 @@ const NUM_FIELDS: [NumKey, string, string][] = [
   ['event_retention_days', 'Event retention (days)', 'Events older than this are dropped.'],
   ['tick_ms', 'Scheduler tick (ms)', ''],
   ['heartbeat_secs', 'Runner heartbeat (s)', ''],
-  ['stuck_repeat_threshold', 'Stuck: repeated call threshold', 'Identical tool calls before a run is flagged stuck.'],
+  ['stuck_repeat_threshold', 'Stuck: repeated call threshold', 'Identical tool calls in one turn before a run is paused. 0 = off (default): it counts sub-agents together, so it misfires on fan-out.'],
   ['stuck_noprogress_turns', 'Stuck: turns without progress', ''],
 ];
 
@@ -35,6 +35,8 @@ export function SettingsPage() {
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [killBusy, setKillBusy] = useState(false);
+  const [egressBusy, setEgressBusy] = useState(false);
+  const [egressResult, setEgressResult] = useState<EgressTest | null>(null);
 
   useEffect(() => {
     if (!loaded.data) return;
@@ -68,7 +70,19 @@ export function SettingsPage() {
     }
   };
 
-  const priceErrors = prices.some((r) => r.model.trim() && (!Number.isFinite(Number(r.input)) || !Number.isFinite(Number(r.output)) || r.input === '' || r.output === ''));
+  const testEgress = async () => {
+    setEgressBusy(true);
+    setEgressResult(null);
+    try {
+      setEgressResult(await api.testEgress(s.egress_proxy_url));
+    } catch {
+      /* toast shown */
+    } finally {
+      setEgressBusy(false);
+    }
+  };
+
+  const priceErrors =prices.some((r) => r.model.trim() && (!Number.isFinite(Number(r.input)) || !Number.isFinite(Number(r.output)) || r.input === '' || r.output === ''));
   const duplicateModels = new Set(prices.map((r) => r.model.trim())).size !== prices.length;
 
   const save = async () => {
@@ -193,8 +207,46 @@ export function SettingsPage() {
         </section>
 
         <section className="card">
-          <h2>Egress allowlist</h2>
-          <p className="help">Hosts runner containers may reach. Everything else is blocked.</p>
+          <h2>Egress</h2>
+          <p className="help">Runners have no direct internet access. They reach package registries and other hosts only through the egress proxy, which allows the hosts listed below.</p>
+          <div className="grid3">
+            <label className="span2">
+              Proxy URL
+              <input
+                value={s.egress_proxy_url ?? ''}
+                onChange={(e) => {
+                  set('egress_proxy_url', e.target.value.trim() ? e.target.value : null);
+                  setEgressResult(null);
+                }}
+                placeholder="http://egress:3128"
+              />
+              <span className="help">Given to runners as HTTP_PROXY and HTTPS_PROXY. With Docker Compose this is http://egress:3128.</span>
+            </label>
+          </div>
+          {!s.egress_proxy_url?.trim() && s.launcher !== 'process' ? (
+            <div className="banner banner-warn">
+              No proxy URL: runners get no proxy, so on an isolated runner network they cannot download dependencies (cargo, npm, pip) or reach any other host.
+            </div>
+          ) : null}
+          <div className="egress-test">
+            <button className="small" disabled={egressBusy || !s.egress_proxy_url?.trim()} onClick={testEgress}>
+              {egressBusy ? 'Testing…' : 'Test proxy'}
+            </button>
+            <span className="help">Checks from the plane that an allowed host gets through and other hosts are refused. Nothing is saved.</span>
+          </div>
+          {egressResult ? (
+            <div className={`cf-result ${egressResult.ok ? 'ok' : 'bad'}`} role="status">
+              <strong>{egressResult.ok ? 'Proxy works' : 'Proxy check failed'}</strong>
+              <span>
+                {egressResult.allowed.ok ? '✓' : '✗'} {egressResult.allowed.host ?? 'allowed host'}: {egressResult.allowed.detail}
+              </span>
+              <span>
+                {egressResult.blocked.ok ? '✓' : '✗'} {egressResult.blocked.host}: {egressResult.blocked.detail}
+              </span>
+            </div>
+          ) : null}
+          <h3>Allowlist</h3>
+          <p className="help">Hosts runners may reach through the proxy. An entry also allows its subdomains. Everything else is refused.</p>
           <ListEditor value={s.egress_allowlist} onChange={(v) => set('egress_allowlist', v)} placeholder="host.example.com" />
         </section>
 

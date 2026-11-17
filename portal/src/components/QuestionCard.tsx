@@ -1,7 +1,10 @@
 import { useState } from 'react';
-import { api, type Question } from '../api';
+import { api, type Decision, type Question } from '../api';
 import { absTime, relTime } from '../lib/format';
 import { useToast } from './Toast';
+
+const PLAN_DECISION: Record<string, string> = { approved: 'Plan approved: building', changes: 'Changes requested', rejected: 'Not building' };
+const PLAN_DECISION_LABEL: Record<string, string> = { approved: 'approved', changes: 'changes requested', rejected: 'not built' };
 
 /** Inline card for an open question or approval; answered ones render read-only. */
 export function QuestionCard({ q, canAnswer, onAnswered }: { q: Question; canAnswer: boolean; onAnswered: (q: Question) => void }) {
@@ -9,11 +12,13 @@ export function QuestionCard({ q, canAnswer, onAnswered }: { q: Question; canAns
   const [busy, setBusy] = useState(false);
   const toast = useToast();
 
-  const submit = async (body: { answer?: string; decision?: 'approved' | 'rejected' }) => {
+  const isPlan = q.kind === 'approval' && q.action === 'plan';
+  const submit = async (body: { answer?: string; decision?: Decision }) => {
     setBusy(true);
     try {
       const updated = await api.answerQuestion(q.id, body);
-      toast(q.kind === 'approval' ? `Approval ${body.decision}` : 'Answer sent', 'ok');
+      const done = isPlan ? PLAN_DECISION[body.decision ?? ''] ?? 'Sent' : q.kind === 'approval' ? `Approval ${body.decision}` : 'Answer sent';
+      toast(done, 'ok');
       setText('');
       onAnswered(updated);
     } catch {
@@ -27,28 +32,41 @@ export function QuestionCard({ q, canAnswer, onAnswered }: { q: Question; canAns
   return (
     <div className={`qcard qcard-${q.kind}${open ? ' open' : ''}`}>
       <div className="qcard-head">
-        <span className="qcard-kind">{q.kind === 'approval' ? 'Approval needed' : 'Question'}</span>
-        {q.action ? <code className="qcard-action">{q.action}</code> : null}
+        <span className="qcard-kind">{isPlan ? 'Plan for review' : q.kind === 'approval' ? 'Approval needed' : 'Question'}</span>
+        {q.action && !isPlan ? <code className="qcard-action">{q.action}</code> : null}
         {q.pr_number != null ? <span className="muted">PR #{q.pr_number}</span> : null}
         <span className="muted qcard-time" title={absTime(q.created_at)}>
           {relTime(q.created_at)}
         </span>
       </div>
-      <div className="qcard-text">{q.text}</div>
+      <div className={`qcard-text${isPlan ? ' qcard-plan' : ''}`}>{q.text}</div>
+      {isPlan ? <div className="muted small">The full plan is on the Artifacts tab.</div> : null}
       {open ? (
         canAnswer ? (
           <div className="qcard-form">
             <textarea
-              rows={2}
               value={text}
-              placeholder={q.kind === 'approval' ? 'Optional comment' : 'Your answer'}
+              rows={isPlan ? 3 : 2}
+              placeholder={isPlan ? 'What should change? (needed for Request changes; optional note otherwise)' : q.kind === 'approval' ? 'Optional comment' : 'Your answer'}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => {
                 if (q.kind === 'question' && e.key === 'Enter' && (e.ctrlKey || e.metaKey) && text.trim()) void submit({ answer: text.trim() });
               }}
             />
             <div className="row">
-              {q.kind === 'approval' ? (
+              {isPlan ? (
+                <>
+                  <button className="ok" disabled={busy} onClick={() => submit({ decision: 'approved', answer: text.trim() || undefined })}>
+                    Approve plan
+                  </button>
+                  <button disabled={busy || !text.trim()} title={text.trim() ? '' : 'Write what should change first'} onClick={() => submit({ decision: 'changes', answer: text.trim() })}>
+                    Request changes
+                  </button>
+                  <button className="danger" disabled={busy} onClick={() => submit({ decision: 'rejected', answer: text.trim() || undefined })}>
+                    Don't build
+                  </button>
+                </>
+              ) : q.kind === 'approval' ? (
                 <>
                   <button className="ok" disabled={busy} onClick={() => submit({ decision: 'approved', answer: text.trim() || undefined })}>
                     Approve
@@ -69,7 +87,11 @@ export function QuestionCard({ q, canAnswer, onAnswered }: { q: Question; canAns
         )
       ) : (
         <div className="qcard-answer">
-          {q.decision ? <span className={`badge ${q.decision === 'approved' ? 'state-finished' : 'state-failed'}`}>{q.decision}</span> : null}
+          {q.decision ? (
+            <span className={`badge ${q.decision === 'approved' ? 'state-finished' : q.decision === 'changes' ? 'state-paused' : 'state-failed'}`}>
+              {isPlan ? PLAN_DECISION_LABEL[q.decision] ?? q.decision : q.decision}
+            </span>
+          ) : null}
           {q.answer ? <span>{q.answer}</span> : null}
           <span className="muted small">
             {q.answered_by ? ` by ${q.answered_by}` : ''}

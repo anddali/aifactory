@@ -87,10 +87,8 @@ async fn slack(State(state): State<AppState>, Path(cid): Path<Uuid>, headers: He
     match crate::connectors::slack::parse_webhook(&headers, &body) {
         Ok(crate::connectors::slack::SlackInbound::UrlVerification(c)) => Json(json!({"challenge": c})).into_response(),
         Ok(crate::connectors::slack::SlackInbound::Events(evs)) => {
-            for ev in evs {
-                if let Err(e) = state.jobs.push(Job::ChatEvent { connector_id: cid, event: ev.clone() }, Some(format!("cev:{cid}:{}", ev.id))).await {
-                    return ApiError::from(e).into_response();
-                }
+            if let Err(e) = crate::slack_socket::enqueue(&state, cid, evs).await {
+                return ApiError::from(e).into_response();
             }
             // Slack wants a fast 200.
             StatusCode::OK.into_response()

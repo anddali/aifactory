@@ -10,7 +10,8 @@ and a plane restart, and expires correctly when left idle.*
 
 | Check | Test |
 |---|---|
-| Trigger → research → question to assignee → answer in Slack → implement, push, PR → review thread fixed, replied, resolved → approval ends the run; runner removed | `e2e_ticket_build` |
+| Trigger → research → plan submitted for review → approved in Slack → implement, push, PR → review thread fixed, replied, resolved → approval ends the run; runner removed | `e2e_ticket_build` |
+| Two-phase runs: plan only in the first turn, changes requested in the thread → revised plan (earlier review superseded), approval in the portal → build instructions with the reviewer's notes → PR; *Don't build* ends an ad hoc run as `declined`; pushes and `pr.open` refused in the plan phase | `e2e_workflows` (`plan_review_changes_then_approval_builds`, ad hoc), `e2e_policy`, `e2e_lifetime` (revival in the plan phase). The plan-budget pause and the forced turn end are not covered by an e2e test (the scripted harness ends its turns itself). **Not yet tried with a real model.** |
 | Runner killed while warm; plane process killed and restarted; the run continues from its checkpoint | `e2e_ticket_build` |
 | Runner crashes mid-turn (after its push, before opening the PR) while one of two plane replicas is dead: one PR, one commit, one announcement | `e2e_resilience` |
 | Duplicate webhook deliveries; first answer wins; the other surface is updated | `e2e_resilience` |
@@ -28,6 +29,7 @@ and a plane restart, and expires correctly when left idle.*
 | Copilot CLI adapter (BYOK, offline, `-p`, JSONL events, `--resume`, `factory` MCP server) | `e2e_copilot` runs the real Copilot CLI (1.0.36) against the plane's model endpoint and the fake provider: MCP tool calls reach primitives, usage is metered and priced, the session resumes on the next turn, the provider key never reaches the runner. Skips itself if Copilot CLI 1.0+ is absent. |
 | Direct model provider, the plane's model endpoint, budget enforcement | `e2e_copilot` (budget exhausted → 402 at the endpoint → cap decision); unit tests for usage parsing and pricing |
 | GitHub, Jira, Slack connectors | unit tests against local mock HTTP servers; contract tests `#[ignore]`d, run with `FACTORY_CONTRACT_*` credentials. **Not run against the real services** (no credentials were available). |
+| Slack Socket Mode (outbound WebSocket instead of webhooks) | unit tests against a local fake Slack (`apps.connections.open` + WebSocket): events and button presses delivered before ack, no ack on a failed enqueue, `disconnect` reconnects; TLS handshake with Slack's real WebSocket host (`contract_tls_handshake`, `#[ignore]`d); checked on a local plane that a Socket Mode connector connects and closes when switched back to HTTP. **Not run against a real Slack app.** |
 | Webhooks with signature verification; polling reconciliation | signature/parsing unit tests per connector; `e2e_triggers` (label webhook, missed webhook found by polling, Slack trigger, ticket cancellation) |
 | Stack detection and the five images | unit tests; images `plane`, `runner-base`, `runner-rust` built locally; the other stack images are written but were not built here |
 | Docker launcher | `e2e_docker` runs a ticket build with real runner containers (skips if the image is absent) |

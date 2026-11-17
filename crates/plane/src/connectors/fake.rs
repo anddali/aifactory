@@ -114,7 +114,11 @@ impl TicketSource for FakeTickets {
             .collect())
     }
     async fn get(&self, key: &str) -> Result<Ticket> {
-        store_get(&self.pool, &self.ns(), key)
+        // Like Jira, keys are case-insensitive on lookup and the stored key is returned.
+        if let Some(t) = store_get::<Ticket>(&self.pool, &self.ns(), key).await? {
+            return Ok(t);
+        }
+        store_get(&self.pool, &self.ns(), &key.to_uppercase())
             .await?
             .ok_or_else(|| anyhow!("ticket {key} not found"))
     }
@@ -629,6 +633,8 @@ pub struct FakeChatMessage {
     #[serde(default)]
     pub mention: Option<String>,
     #[serde(default)]
+    pub button_labels: Option<(String, String)>,
+    #[serde(default)]
     pub edited: bool,
 }
 
@@ -658,6 +664,7 @@ impl FakeChat {
             approval_for: None,
             marker: None,
             mention: None,
+            button_labels: None,
             edited: false,
         };
         store_put(pool, &Self::ns(id), &m.ts, &m).await?;
@@ -680,6 +687,7 @@ impl Chat for FakeChat {
             approval_for: msg.approval_for.clone(),
             marker: msg.marker.clone(),
             mention: msg.mention.clone(),
+            button_labels: msg.button_labels.clone(),
             edited: false,
         };
         store_put(&self.pool, &Self::ns(self.id), &m.ts, &m).await?;
@@ -703,5 +711,10 @@ impl Chat for FakeChat {
     }
     async fn lookup_user_by_email(&self, email: &str) -> Result<Option<String>> {
         Ok(Some(format!("U-{}", email.split('@').next().unwrap_or(email))))
+    }
+    async fn user_email(&self, user: &str) -> Result<Option<String>> {
+        // The inverse of lookup_user_by_email: U-carol is the user whose address starts with carol@.
+        let Some(local) = user.strip_prefix("U-") else { return Ok(None) };
+        Ok(sqlx::query_scalar("SELECT email FROM users WHERE lower(split_part(email,'@',1))=lower($1) ORDER BY created_at LIMIT 1").bind(local).fetch_optional(&self.pool).await?)
     }
 }

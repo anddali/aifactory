@@ -124,6 +124,48 @@ the end of each list.
   other than status reports, messages and questions.
 - **Fargate launcher** uses `startedBy` (derived from run and generation, ≤ 36 chars) for idempotency and one task
   definition per stack image; runner tasks have no task role, so they hold no AWS credentials.
+- **Wire API per model connector.** `direct_model` and `litellm` connectors have `wire_api` = `completions`
+  (default, any OpenAI-compatible endpoint) or `responses`. It travels to the runner in `ModelAccess.wire_api` and
+  the Copilot adapter sets `COPILOT_PROVIDER_WIRE_API`. Newer OpenAI models refuse tools together with reasoning
+  effort on `/chat/completions`; on `/responses` Copilot sends `reasoning.effort` and tools. The plane's endpoint
+  proxies any path and reads Responses usage (`response.usage`), so metering is unchanged.
+- **Two-phase ticket build and ad hoc runs.** A run starts in phase `plan` (`runs.phase`): the first turn gets only
+  the plan part of the template (everything before `<!-- build phase -->`) and submits a plan with `plan.submit`,
+  which stores it as a versioned `plan` artifact and opens an approval question with action `plan` (Slack buttons
+  *Approve plan* / *Don't build*; any other thread reply is the changes wanted). Approval sets phase `build` and
+  delivers the build part of the template with the reviewer's notes; requested changes come back as an answer and the
+  agent resubmits (earlier open reviews are superseded); *Don't build* finishes the run with outcome `declined` and
+  comments on the ticket. In the plan phase the push policy refuses the run's branch (checkpoints to the wip branch
+  are still allowed), and with it `pr.open`. A plan-phase turn that ends without a plan gets one reminder, then the
+  run pauses (`no_plan`); a plan phase that spends more than `plan_budget_share` of the run budget (default 25%) pauses
+  (`plan_budget`). A project template without the marker gets the built-in build part. Security audit and PR review
+  stay single-phase.
+- **Chat users are linked by email on first use.** A Slack user without a linked identity is matched to the factory
+  user with the same email (Slack `users.info`, scope `users:read.email`) and linked (audited as
+  `identity.auto_linked`). Button presses and thread replies that still cannot be matched, or that are refused (role,
+  already answered), get a reply in the run's thread saying why; they used to be dropped silently.
+- **Ending the turn is enforced.** When a primitive that ends the turn returns (`human.ask`, `human.request_approval`,
+  `status.blocked`, `plan.submit`), the plane sends the runner an interrupt, because models keep working regardless of
+  the instruction to stop. An interrupt that arrives after the turn already ended is acknowledged and ignored.
+- **A spent budget stops the turn.** When recorded spend reaches the run budget during a turn, the plane interrupts
+  it instead of letting the harness wait on refused model calls until the turn limit; the cap decision follows.
+- **Identical-call loop detection is off by default** (`stuck_repeat_threshold` = 0). It counted the calls of all
+  sub-agents together, so fan-out looked like a loop, while real loops with varying arguments went unnoticed.
+- **A failed turn pauses the run.** When the harness reports `failed` (model refused the request, CLI crashed),
+  the same turn instruction is queued again as held, the run is paused (`stuck_detected` / `turn_failed`) and
+  the assignee's run thread and ops get the error. Resuming runs the turn again. Before this, a failed turn left
+  the run in `waiting · input` with no message.
+- **Workspace setup failures pause the run.** A runner that starts but cannot set up its workspace (clone refused,
+  bad credentials) would fail the same way on every relaunch, and launch attempts are reset by each runner hello.
+  After 3 setup failures in a row (since the last turn started or the run was resumed) the run is paused with a
+  `stuck_detected` event (`workspace_setup_failed`) and the assignee and ops are told the last error; resuming
+  retries.
+- **Slack Socket Mode** is a per-connector choice (`mode` = `http` | `socket`, default `http`). In Socket Mode the
+  replica holding the singleton lock keeps one outbound WebSocket per such connector (`slack_socket`), reconciled
+  every tick: new or changed connectors (config or secrets) reconnect, removed ones or ones switched back close, and
+  all close when the lock is lost. Envelopes are queued as the webhook would queue them, then acknowledged, so a
+  crash between the two means a redelivery that the usual event-id de-duplication absorbs. The rustls client config
+  names aws-lc-rs explicitly because both ring and aws-lc-rs are linked.
 - **Copilot CLI on Windows** is started through its node entry point rather than the npm batch shim, which cannot
   carry multi-line prompts. `FACTORY_COPILOT_BIN` may point at a binary or a `.js` entry point.
 - **Fake services served by the plane.** `/fake-model/v1` (OpenAI-compatible) and `/fake-litellm` are always

@@ -53,6 +53,13 @@ services:
       DATABASE_URL: postgres://factory:factory@postgres:5432/factory
       FACTORY_ENCRYPTION_KEYS: k1:AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
       FACTORY_EGRESS_LISTEN: 0.0.0.0:3128
+    # The image's own healthcheck probes the plane's port 8080; the proxy listens on 3128 and
+    # has no /healthz, so check that the port answers at all (any HTTP status).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:3128/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     depends_on: { postgres: { condition: service_healthy } }
     networks: [default, runners]
 

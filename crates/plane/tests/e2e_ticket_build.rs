@@ -11,11 +11,13 @@ async fn ticket_build_to_approved_pr_surviving_runner_kill_and_plane_restart() {
     env.ticket("PROJ-1", "Add widget docs").await;
     let id = env.start_ticket_run("PROJ-1").await;
 
-    // Research turn ends with a question to the assignee.
-    let r = env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    // Research turn ends with a plan under review.
+    let r = env.wait_state(id, "waiting", Some("approval"), 90).await;
     assert_eq!(r["questions"].as_array().unwrap().len(), 1);
+    assert_eq!(r["questions"][0]["action"], "plan");
     let msgs = env.chat_messages().await;
-    assert!(msgs.iter().any(|m| m["text"].as_str().unwrap_or("").starts_with("Question:")), "question posted to chat");
+    let plan_msg = msgs.iter().find(|m| m["text"].as_str().unwrap_or("").starts_with("Plan for review: Plan v1")).expect("plan posted to chat");
+    assert_eq!(plan_msg["button_labels"], json!(["Approve plan", "Don't build"]));
 
     // Second trigger for the same ticket is refused by the uniqueness constraint.
     let (s, _) = env.post_status("/api/runs", json!({"project_id": env.project, "workflow": "ticket_build", "ticket_key": "PROJ-1"})).await;
@@ -67,8 +69,9 @@ async fn ticket_build_to_approved_pr_surviving_runner_kill_and_plane_restart() {
     let (s, _) = env.post_status(&format!("/api/fake/{}/pr", env.repo_conn), json!({"repo": env.repo_name, "number": 2})).await;
     assert!(s >= 400, "exactly one PR was opened");
     let msgs = env.chat_messages().await;
-    let questions = msgs.iter().filter(|m| m["text"].as_str().unwrap_or("").starts_with("Question:")).count();
-    assert_eq!(questions, 1, "question posted once");
+    let questions = msgs.iter().filter(|m| m["approval_for"].is_string()).count();
+    assert_eq!(questions, 1, "plan posted once");
+    assert!(msgs.iter().any(|m| m["edited"] == true && m["text"].as_str().unwrap_or("").contains("approved, building by")), "plan message shows the decision");
     let opened = msgs.iter().filter(|m| m["text"].as_str().unwrap_or("").starts_with("Opened PR")).count();
     assert_eq!(opened, 1, "PR announcement posted once");
 

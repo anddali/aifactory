@@ -100,6 +100,7 @@ pub async fn record_usage(state: &AppState, run: &Run, model: &str, input: i64, 
         .execute(&state.pool)
         .await?;
     events::append(&state.pool, &*state.blobs, run.id, "cost", None, json!({"model": model, "input_tokens": input, "output_tokens": output, "cost_usd": cost, "source": source})).await?;
+    crate::engine::after_spend(state, run.id).await?;
     Ok(cost)
 }
 
@@ -216,9 +217,18 @@ async fn fake(State(_state): State<AppState>, Path(path): Path<String>, headers:
             "usage": {"input_tokens": pt, "output_tokens": ct, "total_tokens": pt + ct}});
         return Json(v).into_response();
     }
+    // Plan phase: after its progress report, submit a plan once per conversation.
+    let plan_tool = req["tools"].as_array().and_then(|t| t.iter().find(|x| x["function"]["name"].as_str().unwrap_or("").contains("plan_submit")).cloned());
+    let planned = msgs.iter().any(|m| {
+        m["tool_calls"].as_array().is_some_and(|c| c.iter().any(|c| c["function"]["name"].as_str().unwrap_or("").contains("plan_submit")))
+    });
     let message = if last_role == "user" && tool.is_some() {
         let name = tool.unwrap()["function"]["name"].as_str().unwrap().to_string();
         json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_fake_1", "type": "function", "function": {"name": name, "arguments": "{\"text\":\"fake model progress\"}"}}]})
+    } else if last_role == "tool" && plan_tool.is_some() && !planned {
+        let name = plan_tool.unwrap()["function"]["name"].as_str().unwrap().to_string();
+        let args = json!({"plan": "## Approach\nFake plan from the fake model.\n", "summary": "Fake plan"}).to_string();
+        json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_fake_plan", "type": "function", "function": {"name": name, "arguments": args}}]})
     } else {
         json!({"role": "assistant", "content": "Done. (fake model)"})
     };

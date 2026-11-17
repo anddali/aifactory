@@ -1,7 +1,10 @@
 //! Slack chat connector (Web API).
 //!
-//! Configuration: `api_url` (default `https://slack.com/api`). Secrets: `bot_token` (`xoxb-…`, sent as
-//! `Authorization: Bearer`) and `signing_secret` (used by [`verify_signature`]).
+//! Configuration: `api_url` (default `https://slack.com/api`) and `mode`: `http` (default; Slack
+//! calls the plane's webhook) or `socket` (Socket Mode: the plane holds an outbound WebSocket, see
+//! [`crate::slack_socket`]). Secrets: `bot_token` (`xoxb-…`, sent as `Authorization: Bearer`),
+//! `signing_secret` (HTTP mode, used by [`verify_signature`]) and `app_token` (`xapp-…` with
+//! `connections:write`, Socket Mode).
 //! Bot scopes needed: `chat:write`, `channels:read`, `groups:read`, `channels:history`,
 //! `groups:history`, `users:read`, `users:read.email`.
 //!
@@ -33,7 +36,14 @@ pub struct Slack {
     http: reqwest::Client,
     api: String,
     token: String,
+    app_token: Option<String>,
+    socket: bool,
     channels: Mutex<HashMap<String, String>>,
+}
+
+/// Whether a Slack connector is configured for Socket Mode.
+pub fn is_socket_mode(l: &Loaded) -> bool {
+    l.cfg("mode").as_deref() == Some("socket")
 }
 
 /// What a Slack request to the plane's webhook endpoint carries.
@@ -51,6 +61,8 @@ impl Slack {
             http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
             api: api.trim_end_matches('/').to_string(),
             token: l.secret("bot_token")?,
+            app_token: l.secrets.get("app_token").cloned().filter(|t| !t.is_empty()),
+            socket: is_socket_mode(l),
             channels: Mutex::new(HashMap::new()),
         })
     }
@@ -58,10 +70,14 @@ impl Slack {
     /// Call a Web API method and return the body without checking `ok`. Read methods use GET with
     /// query parameters, write methods a JSON body. Retries on 429 honouring `Retry-After`.
     async fn call_raw(&self, method: &str, http: Method, params: &Value) -> Result<Value> {
+        self.call_raw_as(&self.token, method, http, params).await
+    }
+
+    async fn call_raw_as(&self, token: &str, method: &str, http: Method, params: &Value) -> Result<Value> {
         let url = format!("{}/{method}", self.api);
         let mut attempt = 0;
         loop {
-            let mut rb = self.http.request(http.clone(), &url).bearer_auth(&self.token);
+            let mut rb = self.http.request(http.clone(), &url).bearer_auth(token);
             if http == Method::GET {
                 let q: Vec<(String, String)> = params
                     .as_object()
@@ -103,6 +119,17 @@ impl Slack {
             bail!("slack {method} failed: {}", v["error"].as_str().unwrap_or("unknown error"));
         }
         Ok(v)
+    }
+
+    /// Socket Mode: ask for a fresh WebSocket URL (`apps.connections.open`, app-level token).
+    /// Each URL is single-use and short-lived.
+    pub async fn open_socket_url(&self) -> Result<String> {
+        let token = self.app_token.as_deref().ok_or_else(|| anyhow!("Socket Mode needs an app-level token (xapp-…)"))?;
+        let v = self.call_raw_as(token, "apps.connections.open", Method::POST, &json!({})).await?;
+        if v["ok"].as_bool() != Some(true) {
+            bail!("slack apps.connections.open failed: {}", v["error"].as_str().unwrap_or("unknown error"));
+        }
+        v["url"].as_str().map(String::from).ok_or_else(|| anyhow!("slack apps.connections.open returned no url"))
     }
 
     /// Resolve a channel name to its ID (IDs pass through).
@@ -212,13 +239,14 @@ fn post_body(channel_id: &str, thread: Option<&ChatRef>, msg: &ChatMessage) -> V
         body["metadata"] = json!({"event_type": MARKER_EVENT_TYPE, "event_payload": {"marker": m}});
     }
     if let Some(q) = &msg.approval_for {
+        let (approve, reject) = msg.button_labels.clone().unwrap_or_else(|| ("Approve".into(), "Reject".into()));
         body["blocks"] = json!([
             {"type": "section", "text": {"type": "mrkdwn", "text": truncate(&text, 3000)}},
             {"type": "actions", "block_id": format!("factory_approval:{q}"), "elements": [
                 {"type": "button", "action_id": "factory_approve", "style": "primary",
-                 "text": {"type": "plain_text", "text": "Approve"}, "value": format!("approve:{q}")},
+                 "text": {"type": "plain_text", "text": approve}, "value": format!("approve:{q}")},
                 {"type": "button", "action_id": "factory_reject", "style": "danger",
-                 "text": {"type": "plain_text", "text": "Reject"}, "value": format!("reject:{q}")}
+                 "text": {"type": "plain_text", "text": reject}, "value": format!("reject:{q}")}
             ]}
         ]);
     }
@@ -229,11 +257,13 @@ fn post_body(channel_id: &str, thread: Option<&ChatRef>, msg: &ChatMessage) -> V
 impl Chat for Slack {
     async fn test_connection(&self) -> Result<String> {
         let v = self.call("auth.test", Method::POST, &json!({})).await?;
-        Ok(format!(
-            "connected to Slack workspace {} as {}",
-            v["team"].as_str().unwrap_or("?"),
-            v["user"].as_str().unwrap_or("?")
-        ))
+        let mut msg = format!("connected to Slack workspace {} as {}", v["team"].as_str().unwrap_or("?"), v["user"].as_str().unwrap_or("?"));
+        if self.socket {
+            // Only checks the app-level token; the URL is discarded unused.
+            self.open_socket_url().await?;
+            msg.push_str("; Socket Mode token accepted");
+        }
+        Ok(msg)
     }
 
     async fn post(&self, channel: &str, thread: Option<&ChatRef>, msg: &ChatMessage) -> Result<ChatRef> {
@@ -276,6 +306,12 @@ impl Chat for Slack {
             }
         }
         Ok(None)
+    }
+
+    async fn user_email(&self, user: &str) -> Result<Option<String>> {
+        // Needs the users:read.email scope.
+        let v = self.call("users.info", Method::GET, &json!({"user": user})).await?;
+        Ok(v["user"]["profile"]["email"].as_str().filter(|e| !e.is_empty()).map(String::from))
     }
 
     async fn lookup_user_by_email(&self, email: &str) -> Result<Option<String>> {
@@ -332,27 +368,60 @@ pub fn parse_webhook(headers: &HeaderMap, body: &[u8]) -> Result<SlackInbound> {
     let v: Value = serde_json::from_slice(body)?;
     match v["type"].as_str().unwrap_or_default() {
         "url_verification" => Ok(SlackInbound::UrlVerification(v["challenge"].as_str().unwrap_or_default().to_string())),
-        "event_callback" => {
-            let e = &v["event"];
-            let user_message = e["type"] == "message"
-                && e.get("subtype").is_none()
-                && e.get("bot_id").is_none()
-                && e["user"].is_string();
-            if !user_message {
-                return Ok(SlackInbound::Events(vec![]));
-            }
-            let ts = e["ts"].as_str().unwrap_or_default();
-            Ok(SlackInbound::Events(vec![ChatEvent {
-                id: v["event_id"].as_str().map(String::from).unwrap_or_else(|| format!("msg-{ts}")),
-                channel: e["channel"].as_str().unwrap_or_default().to_string(),
-                thread_ts: e["thread_ts"].as_str().filter(|t| *t != ts).map(String::from),
-                user: e["user"].as_str().unwrap_or_default().to_string(),
-                text: e["text"].as_str().unwrap_or_default().to_string(),
-                action: None,
-            }]))
-        }
-        _ => Ok(SlackInbound::Events(vec![])),
+        _ => Ok(SlackInbound::Events(parse_event_callback(&v))),
     }
+}
+
+/// An Events API `event_callback` body (webhook body, or a Socket Mode `events_api` payload).
+fn parse_event_callback(v: &Value) -> Vec<ChatEvent> {
+    if v["type"] != "event_callback" {
+        return vec![];
+    }
+    let e = &v["event"];
+    let user_message = e["type"] == "message" && e.get("subtype").is_none() && e.get("bot_id").is_none() && e["user"].is_string();
+    if !user_message {
+        return vec![];
+    }
+    let ts = e["ts"].as_str().unwrap_or_default();
+    vec![ChatEvent {
+        id: v["event_id"].as_str().map(String::from).unwrap_or_else(|| format!("msg-{ts}")),
+        channel: e["channel"].as_str().unwrap_or_default().to_string(),
+        thread_ts: e["thread_ts"].as_str().filter(|t| *t != ts).map(String::from),
+        user: e["user"].as_str().unwrap_or_default().to_string(),
+        text: e["text"].as_str().unwrap_or_default().to_string(),
+        action: None,
+    }]
+}
+
+/// One Socket Mode frame from Slack.
+#[derive(Debug)]
+pub enum SocketFrame {
+    Hello,
+    /// Slack is about to close the connection (`refresh_requested`, `warning`, `link_disabled`, ...).
+    Disconnect(String),
+    /// An envelope to acknowledge with its id, and the chat events it carries (possibly none).
+    Envelope { envelope_id: String, events: Vec<ChatEvent> },
+    Other,
+}
+
+/// Parse a Socket Mode text frame. `events_api` payloads are Events API bodies and `interactive`
+/// payloads are interactivity payloads, exactly what the webhook receives in HTTP mode.
+pub fn parse_socket_frame(text: &str) -> Result<SocketFrame> {
+    let v: Value = serde_json::from_str(text)?;
+    let kind = v["type"].as_str().unwrap_or_default();
+    if let Some(id) = v["envelope_id"].as_str() {
+        let events = match kind {
+            "events_api" => parse_event_callback(&v["payload"]),
+            "interactive" => parse_interaction(&v["payload"]),
+            _ => vec![],
+        };
+        return Ok(SocketFrame::Envelope { envelope_id: id.to_string(), events });
+    }
+    Ok(match kind {
+        "hello" => SocketFrame::Hello,
+        "disconnect" => SocketFrame::Disconnect(v["reason"].as_str().unwrap_or_default().to_string()),
+        _ => SocketFrame::Other,
+    })
 }
 
 fn parse_interaction(v: &Value) -> Vec<ChatEvent> {
@@ -459,7 +528,7 @@ mod tests {
         let (api, log) = mock(h).await;
         let s = slack(&api);
         let parent = ChatRef { channel: "C0FACTORY1".into(), ts: "1767600000.000100".into(), thread_ts: None };
-        let msg = ChatMessage { text: "Approve the plan?".into(), approval_for: Some("q-123".into()), marker: Some("chatpost:r1:plan".into()), mention: Some("U0ANN".into()) };
+        let msg = ChatMessage { text: "Approve the plan?".into(), approval_for: Some("q-123".into()), marker: Some("chatpost:r1:plan".into()), mention: Some("U0ANN".into()), button_labels: None };
         let r = s.post("#factory", Some(&parent), &msg).await.unwrap();
         assert_eq!(r, ChatRef { channel: "C0FACTORY1".into(), ts: "1767600000.000200".into(), thread_ts: Some("1767600000.000100".into()) });
         // Second post: channel id comes from the cache; no mention, no buttons, top level.
@@ -549,10 +618,14 @@ mod tests {
             "/api/users.lookupByEmail" if r.query["email"] == "ann@acme.test" => json!({"ok": true, "user": {"id": "U0ANN", "name": "ann"}}),
             "/api/users.lookupByEmail" => json!({"ok": false, "error": "users_not_found"}),
             "/api/auth.test" => json!({"ok": true, "team": "Acme", "user": "factory", "user_id": "U0BOT", "team_id": "T1"}),
+            "/api/users.info" if r.query["user"] == "U0ANN" => json!({"ok": true, "user": {"id": "U0ANN", "profile": {"email": "ann@acme.test"}}}),
+            "/api/users.info" if r.query["user"] == "U0BOT" => json!({"ok": true, "user": {"id": "U0BOT", "profile": {}}}),
             _ => json!({"ok": false, "error": "unknown_method"}),
         });
         let (api, _log) = mock(h).await;
         let s = slack(&api);
+        assert_eq!(s.user_email("U0ANN").await.unwrap().as_deref(), Some("ann@acme.test"));
+        assert_eq!(s.user_email("U0BOT").await.unwrap(), None, "bots have no email");
         assert_eq!(s.lookup_user_by_email("ann@acme.test").await.unwrap().as_deref(), Some("U0ANN"));
         assert_eq!(s.lookup_user_by_email("nobody@acme.test").await.unwrap(), None);
         assert_eq!(s.test_connection().await.unwrap(), "connected to Slack workspace Acme as factory");
@@ -688,7 +761,7 @@ mod tests {
         let marker = format!("contract:{}", Uuid::now_v7());
         let top = s.post(&channel, None, &ChatMessage { text: "Contract test thread".into(), marker: Some(format!("{marker}:top")), ..Default::default() }).await.unwrap();
         let reply = s
-            .post(&channel, Some(&top), &ChatMessage { text: "Contract approval".into(), approval_for: Some(Uuid::now_v7().to_string()), marker: Some(marker.clone()), mention: None })
+            .post(&channel, Some(&top), &ChatMessage { text: "Contract approval".into(), approval_for: Some(Uuid::now_v7().to_string()), marker: Some(marker.clone()), mention: None, button_labels: None })
             .await
             .unwrap();
         assert_eq!(reply.thread_ts.as_deref(), Some(top.ts.as_str()));

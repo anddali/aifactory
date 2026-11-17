@@ -74,18 +74,29 @@ fn unseal(state: &AppState, sealed: &str) -> Result<String> {
 
 /// What the runner uses to reach a model.
 pub async fn runner_access(state: &AppState, run: &Run) -> Result<proto::ModelAccess> {
+    let wire_api = wire_api(state).await?;
     if let (Some(ll), Some(sealed)) = (litellm(state).await?, run.model_key_ref.as_deref()) {
         return Ok(proto::ModelAccess {
             base_url: format!("{}/v1", ll.runner_base_url.trim_end_matches('/')),
             api_key: unseal(state, sealed)?,
             model: run.model.clone(),
+            wire_api,
         });
     }
     Ok(proto::ModelAccess {
         base_url: format!("{}/model/v1", state.cfg.public_urls.first().cloned().unwrap_or_default()),
         api_key: model_key(state, run),
         model: run.model.clone(),
+        wire_api,
     })
+}
+
+/// The model connector's `wire_api` setting (`completions` | `responses`), if set.
+async fn wire_api(state: &AppState) -> Result<Option<String>> {
+    let s = crate::settings::get(&state.pool).await?;
+    let Some(id) = s.model_connector_id else { return Ok(None) };
+    let l = crate::connectors::load(state, id).await?;
+    Ok(l.cfg("wire_api").filter(|w| w == "completions" || w == "responses"))
 }
 
 /// At run start (and on revival): create the LiteLLM virtual key.
@@ -173,6 +184,9 @@ pub async fn record_cost(state: &AppState, run: &Run, model: &str, input: i64, o
         .execute(&state.pool)
         .await?;
     events::append(&state.pool, &*state.blobs, run.id, "cost", None, json!({"model": model, "input_tokens": input, "output_tokens": output, "cost_usd": cost, "source": source})).await?;
+    if source != "litellm_reconciliation" {
+        crate::engine::after_spend(state, run.id).await?;
+    }
     Ok(())
 }
 

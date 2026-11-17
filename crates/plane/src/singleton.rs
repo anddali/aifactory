@@ -26,10 +26,15 @@ pub async fn run(state: AppState) {
                     .unwrap_or(false);
                 if got {
                     tracing::info!(replica = %state.cfg.replica_id, "holding singleton duties");
+                    // Slack Socket Mode connections live exactly as long as the lock.
+                    let mut sockets = crate::slack_socket::Sockets::default();
                     loop {
                         let t0 = std::time::Instant::now();
                         if let Err(e) = tick_once(&state).await {
                             tracing::warn!("singleton tick failed: {e:#}");
+                        }
+                        if let Err(e) = sockets.reconcile(&state).await {
+                            tracing::warn!("slack socket reconcile failed: {e:#}");
                         }
                         if t0.elapsed() > Duration::from_secs(2) {
                             tracing::warn!(ms = t0.elapsed().as_millis() as u64, "slow singleton tick");
@@ -39,6 +44,7 @@ pub async fn run(state: AppState) {
                         // Our lock lives as long as this session does.
                         if sqlx::query("SELECT 1").execute(&mut conn).await.is_err() {
                             tracing::warn!("lost singleton session");
+                            sockets.stop_all();
                             break;
                         }
                     }
@@ -151,6 +157,7 @@ fn describe_wait(run: &Run) -> String {
     match (run.state.as_str(), run.waiting_for.as_deref()) {
         ("paused", _) => format!("an operator to resume it (paused: {})", run.pause_reason.clone().unwrap_or_default()),
         (_, Some("human_answer")) => "your answer to its question".into(),
+        (_, Some("approval")) if run.in_plan_phase() => "your review of its plan".into(),
         (_, Some("approval")) => "your approval".into(),
         (_, Some("review")) => "a review of its pull request".into(),
         (_, Some("ci")) => "CI results".into(),
@@ -191,10 +198,49 @@ pub async fn alert_stuck(state: &AppState, run: &Run, kind: &str, text: &str, pa
     Ok(())
 }
 
+/// The harness failed the turn (model refused the request, CLI crashed). Retrying blindly would
+/// fail the same way and nothing else would happen, so: queue the same turn again (held), pause
+/// the run and tell the assignee and ops the error. Resuming re-runs the turn.
+async fn turn_failed(state: &AppState, run: &Run, tc: &proto::TurnComplete) -> Result<()> {
+    let key = format!("turn_failed:{}:{}", run.id, tc.instruction_id);
+    let first = sqlx::query("INSERT INTO side_effects(key, status) VALUES ($1,'done') ON CONFLICT DO NOTHING")
+        .bind(&key)
+        .execute(&state.pool)
+        .await?
+        .rows_affected()
+        > 0;
+    if !first {
+        return Ok(());
+    }
+    let err: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'message' FROM events WHERE run_id=$1 AND kind='harness.error'
+           AND seq > COALESCE((SELECT max(seq) FROM events WHERE run_id=$1 AND kind='turn_started'),0)
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(run.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .flatten();
+    let err: String = err.unwrap_or_else(|| "the harness reported no error message".into()).chars().take(500).collect();
+    sqlx::query("INSERT INTO instructions(run_id, body, state, input_id) SELECT run_id, body, 'held', input_id FROM instructions WHERE id=$1 AND run_id=$2 AND body->>'type'='turn'")
+        .bind(tc.instruction_id)
+        .bind(run.id)
+        .execute(&state.pool)
+        .await?;
+    events::append(&state.pool, &*state.blobs, run.id, "stuck_detected", None, json!({"kind": "turn_failed", "detail": err, "instruction_id": tc.instruction_id, "paused": true})).await?;
+    engine::pause(state, run, "turn_failed", "stuck-detector", None).await?;
+    humans::notify(state, run, &format!("{key}:assignee"), &format!("The agent's turn failed and the run is paused. Error: {err}\nFix the cause, then resume the run to retry the turn.")).await?;
+    humans::notify_ops(state, run, &format!("{key}:ops"), &format!("[ops] run {} ({}) turn failed: {err}", run.id, run.title)).await?;
+    Ok(())
+}
+
 /// Checks after each turn: a turn that hit its limit, repeated identical tool
 /// calls, and repeated turns with no progress.
 pub async fn detect_after_turn(state: &AppState, run: &Run, tc: &proto::TurnComplete) -> Result<()> {
     let s = crate::settings::get(&state.pool).await?;
+    if tc.outcome == TurnOutcome::Failed {
+        return turn_failed(state, run, tc).await;
+    }
     if tc.outcome == TurnOutcome::TimedOut {
         return alert_stuck(state, run, "turn_over_limit", "a turn exceeded its wall-clock limit", true).await;
     }
@@ -210,7 +256,9 @@ pub async fn detect_after_turn(state: &AppState, run: &Run, tc: &proto::TurnComp
         let k = format!("{}|{}", c.get("name").and_then(|v| v.as_str()).unwrap_or(""), client::canonical_json(c.get("args").unwrap_or(&Value::Null)));
         *counts.entry(k).or_insert(0u32) += 1;
     }
-    if counts.values().any(|n| *n >= s.stuck_repeat_threshold.max(2)) {
+    // 0 turns the rule off. It counts every call in the turn, sub-agents included, so fan-out
+    // looks like a loop and real loops with varying arguments slip through.
+    if s.stuck_repeat_threshold > 0 && counts.values().any(|n| *n >= s.stuck_repeat_threshold.max(2)) {
         return alert_stuck(state, run, "looping", "the agent repeated the same tool call many times in one turn", true).await;
     }
     // No progress: the last N turns made no side-effecting primitive call.

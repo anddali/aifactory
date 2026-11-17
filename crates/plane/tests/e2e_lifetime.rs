@@ -14,7 +14,7 @@ async fn idle_run_checkpoints_reminds_warns_expires_and_revives() {
     .await;
     env.ticket("PROJ-4", "Idle").await;
     let id = env.start_ticket_run("PROJ-4").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
 
     // After the grace period the runner checkpoints and exits; the run keeps waiting.
     let r = env.wait_run(id, "runner stopped after grace", 30, |v| v["runner"]["state"] == "stopped").await;
@@ -31,7 +31,7 @@ async fn idle_run_checkpoints_reminds_warns_expires_and_revives() {
     let exp = kinds.iter().position(|k| *k == "expired").expect("expired");
     assert!(rem < warn && warn < exp);
     let msgs = env.wait_chat("This run expired", 30).await;
-    assert!(msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("Reminder: this run is waiting for your answer")));
+    assert!(msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("Reminder: this run is waiting for your review of its plan")));
     assert!(msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("will expire at")));
     assert!(msgs.iter().any(|m| m["text"].as_str().unwrap_or("").contains("This run expired")));
     // The final summary is also on the ticket.
@@ -42,6 +42,12 @@ async fn idle_run_checkpoints_reminds_warns_expires_and_revives() {
     // Revive from Slack: the run relaunches from its checkpoint.
     env.put(&format!("/api/projects/{}", env.project), json!({"config": {"idle_reminder_secs": 3600, "idle_warning_secs": 7200, "idle_expiry_secs": 10800}})).await;
     env.reply(id, "U-olly", "revive").await;
+    // Revived in its plan phase, the agent submits its plan again; the earlier review is superseded.
+    let r = env.wait_state(id, "waiting", Some("approval"), 120).await;
+    let qs = r["questions"].as_array().unwrap();
+    assert_eq!(qs.iter().filter(|q| q["state"] == "open").count(), 1, "one plan under review");
+    assert!(qs.iter().any(|q| q["decision"] == "superseded"));
+    env.reply(id, "U-alice", "ok").await;
     let r = env.wait_run(id, "revived run continues", 120, |v| v["state"] == "waiting" && v["pr_number"].is_i64()).await;
     assert!(r["expired_at"].is_null());
     let evs = env.events(id).await;
@@ -55,7 +61,7 @@ async fn turn_cap_stops_once_and_waits_for_a_human_and_steering_reaches_the_agen
     let env = Env::new(Opts { project_config: json!({"max_turns": 2}), ..Default::default() }).await;
     env.ticket("PROJ-5", "Caps").await;
     let id = env.start_ticket_run("PROJ-5").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     env.reply(id, "U-alice", "ok").await;
     let r = env.wait_state(id, "waiting", Some("cap_decision"), 120).await;
     let n = r["pr_number"].as_i64().unwrap();

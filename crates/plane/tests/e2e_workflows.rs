@@ -89,11 +89,13 @@ async fn ad_hoc_and_security_audit_report_first_fix_on_confirmation() {
     // Ad hoc: report, then the human says no; nothing is changed.
     let r = env.post("/api/runs", json!({"project_id": env.project, "workflow": "ad_hoc", "title": "Survey the repo", "brief": "Tell me what is in it", "scope": "report first, fix on confirmation"})).await;
     let a: uuid::Uuid = r["id"].as_str().unwrap().parse().unwrap();
-    let r = env.wait_state(a, "waiting", Some("human_answer"), 90).await;
+    let r = env.wait_state(a, "waiting", Some("approval"), 90).await;
     assert!(find(&r["artifacts"], "kind", "report").is_some());
+    assert!(find(&r["artifacts"], "kind", "plan").is_some(), "the proposal is a plan under review");
+    assert_eq!(r["phase"], "plan");
     env.reply(a, "U-alice", "no thanks").await;
     let r = env.wait_state(a, "finished", None, 90).await;
-    assert_eq!(r["outcome"], "completed");
+    assert_eq!(r["outcome"], "declined");
     assert!(r["pr_number"].is_null(), "no change without confirmation");
 
     // Security audit: ranked, verified findings; fix only what is confirmed.
@@ -122,7 +124,7 @@ async fn litellm_per_run_key_budget_and_spend_reconciliation() {
     env.ticket("PROJ-50", "LiteLLM").await;
     let r = env.post("/api/runs", json!({"project_id": env.project, "workflow": "ticket_build", "ticket_key": "PROJ-50", "budget_usd": 0.025})).await;
     let id: uuid::Uuid = r["id"].as_str().unwrap().parse().unwrap();
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     // The virtual key: the run's budget, the run's model only.
     let keys: Vec<(String, Value)> = sqlx::query_as("SELECT id, data FROM fake_store WHERE ns='fake_litellm'").fetch_all(&env.pool).await.unwrap();
     assert_eq!(keys.len(), 1);
@@ -183,7 +185,7 @@ async fn loop_and_no_progress_detection_pause_and_alert() {
     env.put("/api/settings", json!({"stuck_repeat_threshold": 5, "stuck_noprogress_turns": 3})).await;
     env.ticket("PROJ-60", "Loop").await;
     let id = env.start_ticket_run("PROJ-60").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     env.reply(id, "U-alice", "go").await;
     let r = env.wait_state(id, "paused", None, 120).await;
     assert_eq!(r["pause_reason"], "looping");
@@ -199,7 +201,7 @@ async fn no_progress_detection_metrics_and_retention() {
     env.put("/api/settings", json!({"stuck_noprogress_turns": 3})).await;
     env.ticket("PROJ-61", "Spin").await;
     let id = env.start_ticket_run("PROJ-61").await;
-    env.wait_state(id, "waiting", Some("human_answer"), 90).await;
+    env.wait_state(id, "waiting", Some("approval"), 90).await;
     env.reply(id, "U-alice", "go").await;
     let r = env.wait_state(id, "waiting", Some("review"), 90).await;
     let n = r["pr_number"].as_i64().unwrap();
@@ -237,4 +239,45 @@ async fn no_progress_detection_metrics_and_retention() {
     assert!(parts >= 3, "monthly partitions exist");
     let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE run_id=$1").bind(id).fetch_one(&env.pool).await.unwrap();
     assert!(recent > 10, "recent events kept");
+}
+
+/// Two-phase ticket build: the agent plans, the reviewer asks for changes in the thread, the
+/// revised plan is approved in the portal, and only then is anything built.
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_review_changes_then_approval_builds() {
+    let env = Env::new(Opts::default()).await;
+    env.ticket("PROJ-70", "Plan review").await;
+    let id = env.start_ticket_run("PROJ-70").await;
+    let r = env.wait_state(id, "waiting", Some("approval"), 90).await;
+    assert_eq!(r["phase"], "plan");
+    assert!(find(&r["artifacts"], "title", "Plan v1").is_some());
+    assert!(r["pr_number"].is_null(), "nothing built before approval");
+    let start: String = sqlx::query_scalar("SELECT text FROM inputs WHERE run_id=$1 AND kind='start'").bind(id).fetch_one(&env.pool).await.unwrap();
+    assert!(start.contains("phase 1 of 2: plan") && !start.contains("phase 2 of 2"), "the first turn gets only the plan instructions");
+
+    // Changes requested by replying in the thread.
+    env.reply(id, "U-alice", "Please also mention the migration in the doc").await;
+    let r = env
+        .wait_run(id, "plan v2 under review", 90, |v| {
+            v["waiting_for"] == "approval" && v["artifacts"].as_array().is_some_and(|a| a.iter().any(|x| x["title"] == "Plan v2"))
+        })
+        .await;
+    assert_eq!(r["phase"], "plan");
+    let v2 = find(&r["artifacts"], "title", "Plan v2").unwrap();
+    assert!(v2["content"].as_str().unwrap().contains("migration"), "the revision addresses the feedback");
+    let open: Vec<&serde_json::Value> = r["questions"].as_array().unwrap().iter().filter(|q| q["state"] == "open").collect();
+    assert_eq!(open.len(), 1);
+    assert!(r["questions"].as_array().unwrap().iter().any(|q| q["decision"] == "changes"));
+
+    // Approved in the portal: the build phase starts and a PR follows.
+    let q = open[0]["id"].as_str().unwrap().to_string();
+    env.post(&format!("/api/questions/{q}/answer"), json!({"decision": "approved", "answer": "looks good"})).await;
+    let r = env.wait_state(id, "waiting", Some("review"), 120).await;
+    assert_eq!(r["phase"], "build");
+    assert!(r["pr_number"].is_i64());
+    let build: String = sqlx::query_scalar("SELECT text FROM inputs WHERE run_id=$1 AND kind='approval' ORDER BY created_at DESC LIMIT 1").bind(id).fetch_one(&env.pool).await.unwrap();
+    assert!(build.contains("phase 2 of 2: build") && build.contains("Reviewer's notes: looks good"), "{build}");
+    for kind in ["plan_submitted", "plan_changes_requested", "plan_approved"] {
+        assert!(env.count_events(id, kind).await >= 1, "{kind}");
+    }
 }

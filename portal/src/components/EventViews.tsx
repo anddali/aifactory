@@ -1,5 +1,5 @@
 import type { RunEvent } from '../api';
-import { summarize } from '../lib/events';
+import { isFailure, summarize } from '../lib/events';
 import { absTime, clockTime } from '../lib/format';
 import { Expandable } from './JsonView';
 
@@ -76,7 +76,7 @@ export function ChatRow({ e }: { e: RunEvent }) {
     case 'steering':
       side = 'human';
       who = e.actor ?? 'operator';
-      tag = p.interrupt ? 'steer · interrupt' : 'steer';
+      tag = [p.interrupt ? 'steer · interrupt' : 'steer', str('via')].filter(Boolean).join(' · ');
       text = str('text');
       break;
     default:
@@ -109,7 +109,7 @@ export function ToolRow({ e }: { e: RunEvent }) {
     label = `→ ${name || 'tool'}`;
   } else if (e.kind === 'harness.tool_result') {
     label = `← ${name || 'result'}`;
-    cls = p.is_error || p.error ? 'k-bad' : '';
+    cls = isFailure(e) ? 'k-bad' : '';
   } else {
     label = `◆ ${name || 'primitive'} ${p.ok === false ? '✗' : '✓'}${p.replayed ? ' replayed' : ''}`;
     cls = p.ok === false ? 'k-bad' : 'k-prim';

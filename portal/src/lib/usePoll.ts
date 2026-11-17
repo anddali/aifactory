@@ -10,16 +10,22 @@ export function usePoll<T>(fn: () => Promise<T>, ms: number, deps: unknown[] = [
   const [loading, setLoading] = useState(true);
   const fnRef = useRef(fn);
   fnRef.current = fn;
+  // Only the latest request may update state, so a slow response for old deps (e.g. a
+  // previous search) cannot overwrite a newer one.
+  const seq = useRef(0);
 
   const refresh = useCallback(async () => {
+    const mine = ++seq.current;
     try {
       const v = await fnRef.current();
+      if (mine !== seq.current) return;
       setData(v);
       setError(null);
     } catch (e) {
+      if (mine !== seq.current) return;
       setError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (mine === seq.current) setLoading(false);
     }
   }, []);
 

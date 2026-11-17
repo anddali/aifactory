@@ -52,6 +52,30 @@ export interface PersonRef {
   display_name: string;
 }
 
+/** Server-side filters for the runs list; empty values are ignored. */
+/** Approval decisions; `changes` only for plan reviews (with the changes as the answer). */
+export type Decision = 'approved' | 'rejected' | 'changes';
+
+export interface RunFilters {
+  /** Free text: title, ticket key, branch, run id or PR number. */
+  q?: string;
+  /** Exact run states, comma-separated. */
+  status?: string;
+  workflow?: string;
+  harness?: string;
+  model?: string;
+  repo?: string;
+  /** A user id, or `me`. */
+  assignee?: string;
+}
+
+export interface RunFacets {
+  models: string[];
+  harnesses: string[];
+  repos: string[];
+  assignees: { id: string; email: string; display_name: string }[];
+}
+
 export interface RunSummary {
   id: string;
   title: string;
@@ -74,6 +98,8 @@ export interface RunSummary {
   assignee: PersonRef | null;
   model: string;
   harness: string;
+  /** Two-phase workflows: `plan` until the plan is approved, then `build`. */
+  phase?: 'plan' | 'build' | null;
   created_at: string;
   updated_at: string;
   last_activity_at: string;
@@ -178,13 +204,38 @@ export interface Connector {
 }
 
 /** Field descriptors are not fully specified by the contract: accept plain names or objects. */
-export type FieldSpec = string | { name: string; label?: string; type?: string; required?: boolean; default?: unknown; help?: string };
+export type FieldSpec =
+  | string
+  | {
+      name: string;
+      label?: string;
+      type?: string;
+      required?: boolean;
+      default?: unknown;
+      help?: string;
+      placeholder?: string;
+      /** Choices of a `select` field. */
+      options?: { value: string; label: string }[];
+      /** Shown, and required, only while another config field has this value. */
+      show_if?: ShowIf;
+    };
+
+export interface ShowIf {
+  field: string;
+  equals: string;
+}
 
 export interface ConnectorKind {
   kind: string;
+  label?: string;
   role: ConnectorRole;
+  description?: string;
   config_fields: FieldSpec[];
   secret_fields: FieldSpec[];
+  /** Inbound webhook URL with `{id}` standing for the connector id; null when the kind takes none. */
+  webhook_url?: string | null;
+  /** The webhook applies only while this holds (e.g. not in Slack Socket Mode). */
+  webhook_show_if?: ShowIf | null;
 }
 
 export function fieldName(f: FieldSpec): string {
@@ -218,6 +269,8 @@ export interface ProjectConfig {
   max_concurrent_runs?: number;
   daily_spend_usd?: number;
   review_round_limit?: number;
+  /** Share of the run budget the plan phase may spend before the run pauses (0 = no limit). */
+  plan_budget_share?: number;
   merge_by_agent?: boolean;
   fallback_contact?: string | null;
   ops_channel?: string | null;
@@ -295,11 +348,26 @@ export interface ModelPrice {
 
 export type Launcher = 'process' | 'docker' | 'fargate';
 
+export interface EgressProbe {
+  host: string | null;
+  ok: boolean;
+  detail: string;
+}
+
+export interface EgressTest {
+  ok: boolean;
+  proxy: string;
+  allowed: EgressProbe;
+  blocked: EgressProbe;
+}
+
 export interface Settings {
   kill_switch: boolean;
   model_connector_id: string | null;
   model_prices: Record<string, ModelPrice>;
   egress_allowlist: string[];
+  /** Proxy given to runners as HTTP(S)_PROXY; null: runners get none. */
+  egress_proxy_url: string | null;
   deny_patterns: string[];
   event_retention_days: number;
   tick_ms: number;
@@ -431,8 +499,9 @@ export const api = {
   entraLoginUrl: '/auth/entra/login',
 
   // Runs
-  listRuns: (state: 'active' | 'done' | 'all', projectId?: string, limit = 100) =>
-    request<{ runs: RunSummary[] }>('GET', `/api/runs${qs({ state, project_id: projectId, limit })}`),
+  listRuns: (state: 'active' | 'done' | 'all', projectId?: string, limit = 100, filters: RunFilters = {}) =>
+    request<{ runs: RunSummary[] }>('GET', `/api/runs${qs({ state, project_id: projectId, limit, ...filters })}`),
+  runFacets: () => request<RunFacets>('GET', '/api/runs/facets'),
   createRun: (req: CreateRunRequest) => request<RunSummary>('POST', '/api/runs', req),
   getRun: (id: string) => request<RunDetail>('GET', `/api/runs/${enc(id)}`),
   events: (id: string, p: { after?: number; before?: number; limit?: number } = {}) =>
@@ -446,7 +515,7 @@ export const api = {
   teardown: (id: string) => request<unknown>('POST', `/api/runs/${enc(id)}/teardown`, {}),
   cap: (id: string, body: { action: 'raise' | 'end'; max_turns?: number; budget_usd?: number }) =>
     request<unknown>('POST', `/api/runs/${enc(id)}/cap`, body),
-  answerQuestion: (id: string, body: { answer?: string; decision?: 'approved' | 'rejected' }) =>
+  answerQuestion: (id: string, body: { answer?: string; decision?: Decision }) =>
     request<Question>('POST', `/api/questions/${enc(id)}/answer`, body),
 
   // Connectors
@@ -459,6 +528,9 @@ export const api = {
   setConnectorSecrets: (id: string, secrets: Record<string, string>) =>
     request<unknown>('PUT', `/api/connectors/${enc(id)}/secrets`, { secrets }),
   testConnector: (id: string) => request<{ ok: boolean; message: string }>('POST', `/api/connectors/${enc(id)}/test`, {}),
+  /** Test settings as entered, without saving. Blank secrets fall back to the saved ones when `id` is given. */
+  testConnectorDraft: (body: { id?: string; kind: string; config: Record<string, unknown>; secrets: Record<string, string> }) =>
+    request<{ ok: boolean; message: string }>('POST', '/api/connectors/test', body),
   connectorRepos: (id: string) =>
     request<{ repos: { full_name: string; default_branch: string }[] }>('GET', `/api/connectors/${enc(id)}/repos`),
   connectorKinds: () => request<{ kinds: ConnectorKind[] }>('GET', '/api/connector-kinds'),
@@ -489,6 +561,7 @@ export const api = {
   // Settings, audit, metrics
   getSettings: () => request<Settings>('GET', '/api/settings'),
   updateSettings: (body: Partial<Settings>) => request<Settings>('PUT', '/api/settings', body),
+  testEgress: (url: string | null) => request<EgressTest>('POST', '/api/settings/egress-test', { url }),
   audit: (p: { run_id?: string; limit?: number } = {}) =>
     request<{ entries: AuditEntry[] }>('GET', `/api/audit${qs({ run_id: p.run_id, limit: p.limit ?? 200 })}`),
   outcomes: () => request<{ rows: OutcomeRow[] }>('GET', '/api/metrics/outcomes'),

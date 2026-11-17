@@ -60,6 +60,9 @@ pub struct Run {
     pub finish_declared: bool,
     pub blocked_reason: Option<String>,
     pub outcome: Option<String>,
+    /// Two-phase workflows: `plan` until a human approves the plan, then `build`.
+    /// None for single-phase workflows.
+    pub phase: Option<String>,
     pub template_version: Option<String>,
     pub policy_version: Option<String>,
     pub config_version: Option<String>,
@@ -72,6 +75,10 @@ pub struct Run {
 }
 
 impl Run {
+    /// In the plan phase: research and plan only, nothing pushed or opened until approval.
+    pub fn in_plan_phase(&self) -> bool {
+        self.phase.as_deref() == Some("plan")
+    }
     pub fn state(&self) -> RunState {
         RunState::parse(&self.state).unwrap_or(RunState::Failed)
     }
